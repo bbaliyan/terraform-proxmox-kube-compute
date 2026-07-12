@@ -19,20 +19,33 @@ Apache-2.0 — see `LICENSE`/`NOTICE`. Same license as `kube-compute`.
 
 ## Usage
 
+Both options below resolve to *this* repo only — never to the private
+`kube-compute` monorepo, which isn't publicly consumable. The registry address's
+middle segment (`kube-compute`) is just this repo's *name* component under
+OpenTofu's `terraform-<target>-<name>` naming convention, not a reference to
+that other repo.
+
 ```hcl
 module "control_plane" {
-  source  = "app.terraform.io/example/proxmox-kube-compute/tofu" # or a pinned git ref
+  # Option 1: OpenTofu Registry (once published) — resolves to this repo's
+  # root module. No hostname prefix needed for the public registry.
+  source  = "bbaliyan/kube-compute/proxmox"
   version = "~> 0.1"
 
+  # Option 2: pin a git ref against this repo directly instead:
+  #   source = "github.com/bbaliyan/terraform-proxmox-kube-compute?ref=<tag>"
+
   cluster_name        = "example"
-  control_plane_count  = 1
+  control_plane_count = 1
   # ...see variables.tf for the full input set
 }
 
 module "node_pool" {
-  source = "./modules/node-pool" # relative to this module's checkout,
-                                  # or the registry's nested-module address
-  # ...
+  # Nested submodules use the registry's // convention, same version constraint
+  # as the root module above — still this repo's modules/node-pool/:
+  source  = "bbaliyan/kube-compute/proxmox//modules/node-pool"
+  version = "~> 0.1"
+  # ...see modules/node-pool/variables.tf for the full input set
 }
 ```
 
