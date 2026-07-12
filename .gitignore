@@ -1,0 +1,9 @@
+# OpenTofu / Terragrunt runtime artifacts
+.terraform/
+.terragrunt-cache/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Committed lockfile stays tracked — do NOT ignore .terraform.lock.hcl
