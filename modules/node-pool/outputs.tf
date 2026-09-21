@@ -9,7 +9,7 @@ output "worker_node_refs" {
   description = "Map of worker VM name -> {instance_id, ip, provider}."
   value = {
     for k, vm in proxmox_virtual_environment_vm.worker :
-    "${var.cluster_name}-worker-${k}" => {
+    "${var.cluster_name}-${var.pool_name}-${k}" => {
       instance_id = tostring(vm.vm_id)
       ip          = local.worker_ips[k]
       provider    = "proxmox"
@@ -17,8 +17,7 @@ output "worker_node_refs" {
   }
 }
 
-output "rendered_cloud_init" {
-  description = "Map of rendered cloud-config per worker index. Sensitive — for tests/debugging only."
-  value       = { for k, m in module.bootstrap : k => m.cloud_init }
-  sensitive   = true
+output "wildcard_dns_registration_enabled" {
+  description = "Whether this pool published *.<cluster_name> at its workers: manage_wildcard_dns_record with both cluster_domain and dns_server_address set."
+  value       = local.dns_registration_enabled
 }

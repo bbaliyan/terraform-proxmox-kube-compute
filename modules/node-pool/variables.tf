@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# ---- Common inputs (pass through to cloud-init) ----
-variable "cloud_init_template" {
-  description = "Absolute path to the cloud-init template to render. Defaults to the bundled Ubuntu 26.04 LTS template."
-  type        = string
-  default     = null
-}
-
 variable "cluster_name" {
   description = "Cluster identity this pool joins. Must match the control plane's cluster_name."
   type        = string
@@ -16,10 +9,14 @@ variable "cluster_name" {
   }
 }
 
-variable "k8s_version" {
-  description = "K8s distro version this pool's workers install. Must not be newer than control_plane_k8s_version. Null uses the platform default (module.component_versions.k8s_version)."
+variable "pool_name" {
+  description = "Names this pool's VMs <cluster_name>-<pool_name>-<n> and labels every node kube-compute.io/node-group=<pool_name>, which a nodeSelector can pin pods to. Distinct per pool, or two pools' VMs and snippets collide."
   type        = string
-  default     = null
+  default     = "worker"
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,30}$", var.pool_name))
+    error_message = "pool_name must be lowercase alphanumeric/hyphens, start with a letter, max 31 chars."
+  }
 }
 
 variable "trusted_ca_pem" {
@@ -98,6 +95,12 @@ variable "os_image_file_id" {
   default     = null
 }
 
+variable "proxmox_template_vm_id" {
+  description = "VM ID of a pre-baked kube-image Proxmox VM template to full-clone every worker from, instead of booting a stock cloud image. The template already carries OS prep, the RKE2 binaries (both the server and agent units — this pool enables only rke2-agent at launch), SELinux policy, kernel modules, and the guest agent. Null (the default) keeps the stock path via os_image_url/os_image_file_id — kube-image is opt-in. Set exactly one of os_image_url, os_image_file_id, or proxmox_template_vm_id. No compatibility validation is performed between this ID and what is actually baked in it."
+  type        = number
+  default     = null
+}
+
 variable "ssh_authorized_keys" {
   description = "SSH public keys injected into the default cloud user via cloud-init."
   type        = list(string)
@@ -105,7 +108,7 @@ variable "ssh_authorized_keys" {
 }
 
 variable "dns_servers" {
-  description = "DNS nameserver addresses written into every worker's cloud-init network-config."
+  description = "DNS nameserver addresses written into every worker's cloud-init network-config, and passed through to node-bootstrap to give kubelet a search-domain-free resolv-conf — defense in depth against any node-inherited DNS search domain colliding with a wildcard cluster DNS record, on top of node-bootstrap's own prefer_fqdn_over_hostname fix for the specific hostname-derived case (see node-bootstrap's dns_servers variable for the full picture)."
   type        = list(string)
   default     = ["1.1.1.1", "8.8.8.8"]
 }
@@ -137,29 +140,108 @@ variable "desired_count" {
   }
 }
 
-variable "control_plane_k8s_version" {
-  description = "The control plane's k8s_version. This pool's k8s_version is rejected if it is newer."
-  type        = string
-}
-
 variable "registration_address" {
-  description = "The control plane's registration_address output (kube-vip VIP for HA, or the sole node's IP for single-node). Workers join via --server https://<this>:6443."
+  description = "The address workers join through. Null (the default) self-computes the genesis node's single-target self-registered DNS name (genesis.<cluster_name>.<cluster_domain>) — requires cluster_domain and dns_server_address to both be set. Pass an explicit value only when DNS isn't configured (the operator must then know and pin genesis's actual address themselves, e.g. a literal IP, matching how worker_ip_addresses is already a literal in this same file). Prefer the self-computed DNS name over cluster_fqdn (the round-robin api.* record) — a round-robin record causes 10-20+ minute join hangs that a single-target name does not."
   type        = string
+  default     = null
 }
 
 variable "cluster_agent_token" {
-  description = "The control plane's cluster_agent_token output. Embedded directly into this pool's cloud-init (no managed secret store on Proxmox). Sensitive."
+  description = "The agent join token for this cluster. Embedded directly into this pool's cloud-init (no managed secret store on Proxmox). Sourced from the control plane's own cluster_agent_token output at the consumer's Terragrunt layer — there is no Terraform-level dependency between this module and proxmox-control-plane, only a value handed through. Sensitive."
   type        = string
   sensitive   = true
 }
 
-variable "cluster_ipset_name" {
-  description = "The control plane's cluster_ipset_name output. Referenced by name ('+<name>') in this pool's own per-VM firewall rules — the pool never creates or owns the ipset itself."
-  type        = string
-}
-
 variable "extra_node_labels" {
-  description = "Additional --node-label flags for every worker in this pool."
+  description = "Additional node-label: entries for every worker in this pool."
   type        = map(string)
   default     = {}
+}
+
+variable "node_taints" {
+  description = "Taints on every worker in this pool, each key=value:Effect. A label only lets pods be pinned here; a taint keeps every pod without a matching toleration off."
+  type        = list(string)
+  default     = []
+}
+
+variable "allowed_ingress_cidrs" {
+  description = "CIDR blocks allowed to reach ingress_ports on this pool's workers from outside the cluster. Set on the pool that runs ingress."
+  type        = list(string)
+  default     = []
+}
+
+variable "ingress_ports" {
+  description = "TCP ports opened from allowed_ingress_cidrs on this pool's workers, e.g. [80, 443] for Traefik. Never add 22 (SSH)."
+  type        = list(number)
+  default     = []
+}
+
+variable "manage_wildcard_dns_record" {
+  description = "Whether this pool publishes *.<cluster_name> at its workers when DNS is configured. Only one pool of a cluster should, the one running ingress."
+  type        = bool
+  default     = true
+}
+
+# ---- Wildcard DNS registration (optional): publishes *.<cluster_name> via RFC2136 ----
+# On a dedicated_control_plane cluster the control plane is tainted, so this
+# pool's workers are where ingress actually runs — this pool, not
+# proxmox-control-plane, owns the wildcard record in that shape. All
+# null/default = no record published, same "DNS is optional, name-only by
+# default" rule as every other provider module. Mirrors
+# proxmox-control-plane's identical dns_server_address/tsig_* block.
+variable "cluster_domain" {
+  description = "DNS suffix matching the control plane's own cluster_domain (e.g. 'homelab.local'). Required to compute the wildcard record's zone; ignored when dns_server_address is null."
+  type        = string
+  default     = null
+}
+
+variable "dns_server_address" {
+  description = "Hostname or IPv4 address of an RFC2136-compliant DNS server to publish the wildcard record to. Null (default) skips DNS registration entirely; register the wildcard yourself in that case."
+  type        = string
+  default     = null
+}
+
+variable "dns_server_port" {
+  description = "Port the DNS server accepts dynamic updates on. Ignored when dns_server_address is null."
+  type        = number
+  default     = 53
+}
+
+variable "dns_transport" {
+  description = "Transport for the dynamic update: 'udp', 'tcp', 'udp4', 'udp6', 'tcp4', or 'tcp6'. Ignored when dns_server_address is null. Defaults to 'udp' — see proxmox-control-plane's identical variable for why (tcp was found to fail against Technitium with a mid-update EOF)."
+  type        = string
+  default     = "udp"
+  validation {
+    condition     = contains(["udp", "tcp", "udp4", "udp6", "tcp4", "tcp6"], var.dns_transport)
+    error_message = "dns_transport must be one of: udp, tcp, udp4, udp6, tcp4, tcp6."
+  }
+}
+
+variable "dns_record_ttl" {
+  description = "TTL in seconds for the published wildcard record. Ignored when dns_server_address is null. Kept low by default — see proxmox-control-plane's dns_record_ttl for why a low TTL matters here (downstream resolver caching can otherwise stale-block a fresh apply for up to a full TTL)."
+  type        = number
+  default     = 30
+}
+
+variable "tsig_key_name" {
+  description = "Name of the TSIG key configured on the DNS server, used to authenticate the dynamic update. Required when dns_server_address is set."
+  type        = string
+  default     = null
+}
+
+variable "tsig_key_algorithm" {
+  description = "TSIG key algorithm: 'hmac-md5', 'hmac-sha1', 'hmac-sha256', or 'hmac-sha512'. Must match how the key was created on the DNS server. Ignored when dns_server_address is null."
+  type        = string
+  default     = "hmac-sha256"
+  validation {
+    condition     = contains(["hmac-md5", "hmac-sha1", "hmac-sha256", "hmac-sha512"], var.tsig_key_algorithm)
+    error_message = "tsig_key_algorithm must be one of: hmac-md5, hmac-sha1, hmac-sha256, hmac-sha512."
+  }
+}
+
+variable "tsig_key_secret" {
+  description = "Base64-encoded TSIG shared secret. Required when dns_server_address is set. Sensitive — supply via a TF_VAR_* environment variable, never committed."
+  type        = string
+  default     = null
+  sensitive   = true
 }

@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# ---- Common inputs (pass through to cloud-init) ----
-variable "cloud_init_template" {
-  description = "Absolute path to the cloud-init template to render. Defaults to the bundled Ubuntu 26.04 LTS template. Supply your own path for other distributions — no compatibility guarantee is made for untested distributions."
+# ---- Day-2 guest-access credentials (node-bootstrap itself never connects to the
+# node — these exist for node-os-patch and any other operator tooling that does) ----
+variable "ssh_private_key_file" {
+  description = "Path to the SSH private key for guest access (the public half must be in ssh_authorized_keys). Matches kube-devenv's kube-shell/kube-status default key."
   type        = string
-  default     = null
+  default     = "~/.ssh/id_ed25519_kube_cluster"
+}
+
+variable "ssh_user" {
+  description = "SSH user for guest access. Matches kube-devenv's kube-shell/kube-status default user for the AlmaLinux 10 image."
+  type        = string
+  default     = "almalinux"
 }
 
 variable "cluster_name" {
@@ -14,12 +21,6 @@ variable "cluster_name" {
     condition     = can(regex("^[a-z][a-z0-9-]{0,30}$", var.cluster_name))
     error_message = "cluster_name must be lowercase alphanumeric/hyphens, start with a letter, max 31 chars."
   }
-}
-
-variable "k8s_version" {
-  description = "K8s distro version (a K3s release string today, e.g. v1.36.1+k3s1). Neutral name. Null uses the platform default (module.component_versions.k8s_version)."
-  type        = string
-  default     = null
 }
 
 variable "trusted_ca_pem" {
@@ -35,34 +36,46 @@ variable "registry_mirror_url" {
   default     = null
 }
 
-variable "gitops_platform_repo_url" {
-  description = "Optional Argo CD platform Application source repo. Null = skip Argo CD wiring."
+variable "extra_server_manifests" {
+  description = "Arbitrary RKE2 auto-deploy manifest files (filename => full YAML content), forwarded verbatim through proxmox-control-plane to node-bootstrap's own identically-named variable, which writes them to /var/lib/rancher/rke2/server/manifests/ on the genesis control-plane node only. This module does not interpret the content — e.g. a HelmChartConfig overriding the packaged rke2-coredns chart's Corefile to add an internal-DNS forward zone, a Proxmox-only need since (unlike AWS/Azure's cloud DNS) there is no network-layer resolution for a homelab/on-prem private zone. Empty by default, so callers that don't need this are unaffected."
+  type        = map(string)
+  default     = {}
+}
+
+variable "gitops_platform_enabled" {
+  description = "Whether to bootstrap kube-platform at all. false = a bare RKE2+Cilium cluster, no Argo CD/platform Application."
+  type        = bool
+  default     = true
+}
+
+variable "gitops_platform_repo_url_override" {
+  description = "Override for kube-platform's repo URL. Null (the default) passes through to node-bootstrap, which falls back to its own pinned default — this module is not the source of truth for the pin."
   type        = string
   default     = null
 }
 
-variable "gitops_platform_revision" {
-  description = "Branch/tag/SHA the platform Application tracks."
+variable "gitops_platform_revision_override" {
+  description = "Override for the branch/tag/SHA the platform Application tracks. Null (the default) passes through to node-bootstrap's own pinned default."
   type        = string
-  default     = "main"
+  default     = null
 }
 
 variable "gitops_workloads_repo_url" {
-  description = "Optional user workloads Application source repo. Null = no workloads Application."
+  description = "Optional user-defined workloads Application source repo, independent of the platform Application (no shared ordering). Null (the default) = no workloads Application."
   type        = string
   default     = null
 }
 
 variable "gitops_workloads_revision" {
-  description = "Branch/tag/SHA the workloads Application tracks."
+  description = "Branch/tag/SHA the workloads Application tracks. Only meaningful when gitops_workloads_repo_url is set."
   type        = string
   default     = "main"
 }
 
 variable "gitops_workloads_path" {
-  description = "Path within the workloads repo the ApplicationSet scans."
+  description = "Path within the workloads repo Argo CD applies. Only meaningful when gitops_workloads_repo_url is set."
   type        = string
-  default     = "apps"
+  default     = "."
 }
 
 variable "cluster_type" {
@@ -76,31 +89,13 @@ variable "cluster_type" {
 }
 
 variable "cni" {
-  description = "CNI to install: 'flannel' or 'cilium'. Null (default) auto-derives to 'cilium' when control_plane_count > 1 and 'flannel' for control_plane_count = 1. Set explicitly to override."
+  description = "CNI to install: 'default' or 'cilium'. Null (default) resolves to 'cilium' regardless of topology — Canal/flannel's iptables/ipset dataplane ('default') is broken on AlmaLinux 10, this project's only supported OS (its kernel dropped modules flannel and Felix require). 'default' remains an escape hatch for a consumer-supplied playbook targeting a different OS."
   type        = string
   default     = null
   validation {
-    condition     = var.cni == null || contains(["flannel", "cilium"], var.cni)
-    error_message = "cni must be null, 'flannel', or 'cilium'."
+    condition     = var.cni == null || contains(["default", "cilium"], var.cni)
+    error_message = "cni must be null, 'default', or 'cilium'."
   }
-}
-
-variable "etcd_snapshots_enabled" {
-  description = "Enable K3s' built-in scheduled etcd snapshots (local only — Proxmox has no S3-equivalent wired in this module; use a future NFS/S3-compatible option if needed). Null (default) auto-derives to true when control_plane_count > 1 and false for control_plane_count = 1."
-  type        = bool
-  default     = null
-}
-
-variable "etcd_snapshot_schedule_cron" {
-  description = "Cron schedule for etcd snapshots. Only meaningful when etcd_snapshots_enabled resolves to true."
-  type        = string
-  default     = "0 */12 * * *"
-}
-
-variable "etcd_snapshot_retention" {
-  description = "Number of local etcd snapshots to retain. Only meaningful when etcd_snapshots_enabled resolves to true."
-  type        = number
-  default     = 5
 }
 
 variable "cert_mode" {
@@ -117,6 +112,18 @@ variable "platform_extra_helm_parameters" {
   description = "Additional Helm parameters forwarded verbatim to the kube-platform bootstrap Application."
   type        = map(string)
   default     = {}
+}
+
+variable "workloads_extra_helm_parameters" {
+  description = "Helm parameters forwarded verbatim to the workloads Application. See node-bootstrap for full description."
+  type        = map(string)
+  default     = {}
+}
+
+variable "workloads_helm_values_object" {
+  description = "Arbitrary object forwarded to the workloads Application as helm.valuesObject. Use for values a map(string) cannot carry, such as a pod's tolerations."
+  type        = any
+  default     = null
 }
 
 variable "platform_helm_values_object" {
@@ -204,6 +211,12 @@ variable "os_image_file_id" {
   default     = null
 }
 
+variable "proxmox_template_vm_id" {
+  description = "VM ID of a pre-baked kube-image Proxmox VM template to full-clone every control-plane node from, instead of booting a stock cloud image. The template carries OS prep, RKE2 binaries (both server and agent units — role chosen at launch), SELinux policy, kernel modules, and the guest agent, so a node reaches Ready much faster than the stock-image path. Null (the default) keeps the stock path via os_image_url/os_image_file_id — kube-image is opt-in. Set exactly one of os_image_url, os_image_file_id, or proxmox_template_vm_id. No compatibility validation is performed against what's actually baked in the template — its self-describing name (kube-image-<k8s_version>-<cilium_version>-<argocd_version>-<build-date>) is documentation only."
+  type        = number
+  default     = null
+}
+
 variable "ssh_authorized_keys" {
   description = "SSH public keys injected into the default cloud user via the Proxmox cloud-init drive, for out-of-band VM access. Null = no keys injected."
   type        = list(string)
@@ -211,7 +224,7 @@ variable "ssh_authorized_keys" {
 }
 
 variable "dns_servers" {
-  description = "DNS nameserver addresses written into every control-plane VM's cloud-init network-config."
+  description = "DNS nameserver addresses written into every control-plane VM's cloud-init network-config, and passed through to node-bootstrap to give kubelet a search-domain-free resolv-conf (see node-bootstrap's dns_servers variable: kubelet's default DNS policy otherwise propagates this node's hostname-derived search domain into every pod, colliding with the wildcard cluster DNS record for that zone)."
   type        = list(string)
   default     = ["1.1.1.1", "8.8.8.8"]
 }
@@ -227,13 +240,13 @@ variable "control_plane_count" {
 }
 
 variable "control_plane_ip_addresses" {
-  description = "Static IPv4 addresses in CIDR notation (e.g. '192.168.1.10/24'), one per control-plane node, in order. Required when control_plane_count > 1 (join tokens, TLS SANs, and the etcd firewall ipset all need known IPs at plan time — DHCP is only supported for control_plane_count = 1). Null with control_plane_count = 1 falls back to DHCP, matching node-proxmox's existing behavior."
+  description = "Static IPv4 addresses in CIDR notation (e.g. '192.168.1.10/24'), one per control-plane node, in order. Optional at any control_plane_count: when null, every control-plane node gets its IP via DHCP, resolved post-apply through the Proxmox guest agent (used for join tokens, TLS SANs, the etcd firewall ipset, and the dns-registration record). Static IPs remain the practical default for HA — genesis must be reachable before joiners' node-bootstrap runs, and DHCP-assigned IPs are only known after each VM boots."
   type        = list(string)
   default     = null
 
   validation {
-    condition     = var.control_plane_count == 1 || (var.control_plane_ip_addresses != null && length(var.control_plane_ip_addresses) == var.control_plane_count)
-    error_message = "control_plane_ip_addresses must be set with exactly control_plane_count entries when control_plane_count > 1."
+    condition     = var.control_plane_ip_addresses == null || length(var.control_plane_ip_addresses) == var.control_plane_count
+    error_message = "When set, control_plane_ip_addresses must have exactly control_plane_count entries."
   }
 }
 
@@ -243,19 +256,8 @@ variable "vm_gateway" {
   default     = null
 }
 
-variable "control_plane_vip_address" {
-  description = "kube-vip virtual IP (bare IPv4, no CIDR suffix) on the cluster's L2 subnet, used as the registration_address when control_plane_count > 1. Required in that case — Proxmox has no load balancer primitive, so a floating ARP VIP is the HA registration endpoint."
-  type        = string
-  default     = null
-
-  validation {
-    condition     = var.control_plane_count == 1 || var.control_plane_vip_address != null
-    error_message = "control_plane_vip_address is required when control_plane_count > 1."
-  }
-}
-
 variable "cluster_network_cidr" {
-  description = "CIDR of the cluster's L2 subnet (e.g. '192.168.1.0/24'), used as the sole member of the cluster-wide firewall ipset. Proxmox multi-node is a single flat L2 subnet, and bpg/proxmox's ipset resource is owned monolithically by one Terraform state, so exact per-VM membership (AWS's self-referencing security group) can't span the control plane's and each node pool's separate states — this CIDR is the pragmatic Proxmox equivalent of 'this cluster's own members'. Required when control_plane_count > 1 or when any node pool will attach; optional (module still creates the ipset) for a single-node cluster with no pools."
+  description = "CIDR of the cluster's L2 subnet (e.g. '192.168.1.0/24'), used as the sole member of the cluster-wide firewall ipset. Proxmox multi-node is a single flat L2 subnet, and bpg/proxmox's ipset resource is owned monolithically by one Terraform state, so exact per-VM membership (AWS's self-referencing security group) can't span the control plane's and each node pool's separate states — this CIDR is the pragmatic Proxmox equivalent of 'this cluster's own members'. Required when control_plane_count > 1 or any node pool will attach; optional for a single-node cluster with no pools."
   type        = string
   default     = null
 }
@@ -266,14 +268,203 @@ variable "allowed_ingress_cidrs" {
 }
 
 variable "ingress_ports" {
-  description = "TCP ports opened from allowed_ingress_cidrs on every control-plane VM: 443/80 Traefik, 6443 K3s API. Never add 22 (SSH)."
+  description = "TCP ports opened from allowed_ingress_cidrs on every control-plane VM: 443/80 Traefik, 6443 Kubernetes API. Never add 22 (SSH)."
   type        = list(number)
   default     = [80, 443, 6443]
 }
 
-# DNS: optional naming only. This module creates NO DNS records — Proxmox has no managed DNS.
+# DNS: cluster_domain is name-only; this module creates NO DNS records on its own.
+# Real record publication (optional) is the separate dns_server_address/tsig_* block below.
 variable "cluster_domain" {
-  description = "Optional DNS suffix (e.g. 'homelab.local'). When set, FQDN = api.<cluster_name>.<cluster_domain> and wildcard = *.<cluster_name>.<cluster_domain>. No DNS record is created — register wildcard_dns_name at cluster_ip/control_plane_vip_address in your local resolver."
+  description = "DNS suffix (e.g. 'homelab.local'). When set, FQDN = api.<cluster_name>.<cluster_domain> and wildcard = *.<cluster_name>.<cluster_domain>. Required when control_plane_count > 1: Proxmox has no load-balancer/VIP primitive, so cluster_fqdn is the only address that names every control-plane node."
   type        = string
   default     = null
+
+  validation {
+    condition     = var.control_plane_count == 1 || var.cluster_domain != null
+    error_message = "cluster_domain is required when control_plane_count > 1."
+  }
+}
+
+# ---- DNS registration (optional): publishes cluster_fqdn via RFC2136 dynamic update ----
+# All null/default = no record is published, matching every other provider module's
+# "DNS is optional, name-only by default" rule. Set dns_server_address to enable.
+variable "dns_server_address" {
+  description = "Hostname or IPv4 address of an RFC2136-compliant DNS server to publish cluster_fqdn to (any server that speaks RFC2136 — not tied to a specific product). Null (default) skips DNS registration entirely; register wildcard_dns_name/cluster_fqdn yourself in that case."
+  type        = string
+  default     = null
+}
+
+variable "dns_server_port" {
+  description = "Port the DNS server accepts dynamic updates on. Ignored when dns_server_address is null."
+  type        = number
+  default     = 53
+}
+
+variable "dns_transport" {
+  description = "Transport for the dynamic update: 'udp', 'tcp', 'udp4', 'udp6', 'tcp4', or 'tcp6'. Ignored when dns_server_address is null. Defaults to 'udp': a real apply against Technitium found 'tcp' fails with 'Error updating DNS record: EOF' (connection drops mid-update); 'udp' is the transport actually proven end-to-end. A handful of IPv4 addresses in one A record set fits comfortably under UDP's message-size limit, so there's no capacity reason to prefer TCP."
+  type        = string
+  default     = "udp"
+  validation {
+    condition     = contains(["udp", "tcp", "udp4", "udp6", "tcp4", "tcp6"], var.dns_transport)
+    error_message = "dns_transport must be one of: udp, tcp, udp4, udp6, tcp4, tcp6."
+  }
+}
+
+variable "dns_record_ttl" {
+  description = "TTL in seconds for the published cluster_fqdn record, and for the genesis node's own self-registered record. Ignored when dns_server_address is null. Kept low by default — see proxmox-control-plane's dns_record_ttl for why a low TTL matters here (downstream resolver caching can otherwise stale-block a fresh apply's join for up to a full TTL)."
+  type        = number
+  default     = 30
+}
+
+variable "tsig_key_name" {
+  description = "Name of the TSIG key configured on the DNS server, used to authenticate the dynamic update. Required when dns_server_address is set."
+  type        = string
+  default     = null
+}
+
+variable "tsig_key_algorithm" {
+  description = "TSIG key algorithm: 'hmac-md5', 'hmac-sha1', 'hmac-sha256', or 'hmac-sha512'. Must match how the key was created on the DNS server. Ignored when dns_server_address is null."
+  type        = string
+  default     = "hmac-sha256"
+  validation {
+    condition     = contains(["hmac-md5", "hmac-sha1", "hmac-sha256", "hmac-sha512"], var.tsig_key_algorithm)
+    error_message = "tsig_key_algorithm must be one of: hmac-md5, hmac-sha1, hmac-sha256, hmac-sha512."
+  }
+}
+
+variable "tsig_key_secret" {
+  description = "Base64-encoded TSIG shared secret. Required when dns_server_address is set. Sensitive — supply via a TF_VAR_* environment variable, never committed."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+# ---- Worker pools (optional, merged into this same directory/state) ----
+variable "node_pools" {
+  description = <<-EOT
+    Static worker pools joining this cluster, keyed by pool name (e.g. "platform"), each created via
+    proxmox-node-pool with this cluster's identity and join token wired in. Empty map (the default)
+    creates none.
+
+    Every worker of a pool is named <cluster_name>-<pool>-<n> and carries
+    kube-compute.io/node-group=<pool>. node_taints keeps other pods off.
+
+    Fields left null take the cluster's own value: trusted_ca_pem, registry_mirror_url,
+    ssh_authorized_keys, dns_servers, vm_gateway, and the DNS registration settings.
+  EOT
+  type = map(object({
+    trusted_ca_pem         = optional(string)
+    registry_mirror_url    = optional(string)
+    proxmox_node           = string
+    disk_datastore_id      = optional(string, "local-lvm")
+    iso_datastore_id       = optional(string, "local")
+    network_bridge         = optional(string, "vmbr0")
+    vm_cores               = number
+    vm_memory_mb           = number
+    vm_disk_gb             = number
+    vm_cpu_type            = optional(string, "x86-64-v2-AES")
+    os_image_url           = optional(string)
+    os_image_file_name     = optional(string)
+    os_image_file_id       = optional(string)
+    proxmox_template_vm_id = optional(number)
+    ssh_authorized_keys    = optional(list(string))
+    dns_servers            = optional(list(string))
+    worker_ip_addresses    = optional(list(string))
+    vm_gateway             = optional(string)
+    desired_count          = optional(number, 2)
+    registration_address   = optional(string)
+    extra_node_labels      = optional(map(string), {})
+    node_taints            = optional(list(string), [])
+    cluster_domain         = optional(string)
+    dns_server_address     = optional(string)
+    dns_server_port        = optional(number)
+    dns_transport          = optional(string)
+    dns_record_ttl         = optional(number)
+    tsig_key_name          = optional(string)
+    tsig_key_algorithm     = optional(string)
+    tsig_key_secret        = optional(string)
+  }))
+  default = {}
+}
+
+variable "platform_node_group" {
+  description = "node_pools key of the pool that runs the platform stack, ingress included. The platform Application pins its components to that pool's node-group label, the pool alone opens ingress_ports (the control plane keeps 6443), and the wildcard DNS record points at its workers. Null leaves all of that on the control plane, or on every pool of a dedicated_control_plane cluster."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.platform_node_group == null ? true : contains(keys(var.node_pools), var.platform_node_group)
+    error_message = "platform_node_group must name a node_pools entry."
+  }
+}
+
+# ---- Cluster autoscaler (optional, passed through to proxmox-control-plane/node-bootstrap) ----
+variable "cluster_autoscaler_enabled" {
+  description = "Whether to genesis-apply CAPI/CAPMOX's MachineDeployment + cluster-autoscaler for this cluster. false (the default) means zero autoscaler-related resources exist — no CAPI install, no MachineDeployment, nothing for cluster-autoscaler to manage."
+  type        = bool
+  default     = false
+}
+
+variable "cluster_autoscaler_worker_min_size" {
+  description = "Minimum worker count cluster-autoscaler maintains. Only meaningful when cluster_autoscaler_enabled is true."
+  type        = number
+  default     = 0
+}
+
+variable "cluster_autoscaler_worker_max_size" {
+  description = "Maximum worker count cluster-autoscaler will scale to. Only meaningful when cluster_autoscaler_enabled is true."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = !var.cluster_autoscaler_enabled || var.cluster_autoscaler_worker_max_size > 0
+    error_message = "cluster_autoscaler_worker_max_size must be > 0 when cluster_autoscaler_enabled is true — leaving it at the 0 default renders a valid but useless MachineDeployment that can never scale up."
+  }
+}
+
+variable "cluster_autoscaler_worker_template" {
+  description = "VM shape for CAPI-provisioned autoscaled workers — same fields proxmox-node-pool's own node_pools objects carry, mapped to ProxmoxMachineTemplate fields per the research spike's field-mapping table. Null (default) is valid only when cluster_autoscaler_enabled is false."
+  type = object({
+    vm_cores               = number
+    vm_memory_mb           = number
+    vm_disk_gb             = number
+    proxmox_template_vm_id = number
+    network_bridge         = string
+    disk_datastore_id      = string
+    proxmox_node           = string
+  })
+  default = null
+
+  validation {
+    condition     = !var.cluster_autoscaler_enabled || var.cluster_autoscaler_worker_template != null
+    error_message = "cluster_autoscaler_worker_template is required when cluster_autoscaler_enabled is true."
+  }
+}
+
+variable "cluster_autoscaler_worker_ip_pool" {
+  description = "Static IPv4 pool CAPMOX allocates autoscaler-worker addresses from, via ProxmoxCluster.spec.ipv4Config. CAPMOX has no DHCP mode for CAPI-managed Machines — confirmed against the live CRD (kubectl explain proxmoxcluster.spec.ipv4Config): ProxmoxClusterSpec's CEL validation hard-requires ipv4Config or ipv6Config, and ProxmoxMachine's own network.default has no dhcp toggle, only an optional ipv4PoolRef. This differs from proxmox-node-pool's plain Terraform-provisioned workers, which use DHCP freely — that path never goes through CAPMOX's own ipam.cluster.x-k8s.io IPAddressClaim/IPAddress machinery. `addresses` must be a small range/list carved out of the caller's LAN and excluded from their router's DHCP pool (CAPMOX assigns from it directly, unmanaged by DHCP) — sized for at least cluster_autoscaler_worker_max_size concurrent addresses. Null (default) is valid only when cluster_autoscaler_enabled is false."
+  type = object({
+    addresses = list(string)
+    gateway   = string
+    prefix    = number
+    metric    = optional(number, 100)
+  })
+  default = null
+
+  validation {
+    condition     = !var.cluster_autoscaler_enabled || var.cluster_autoscaler_worker_ip_pool != null
+    error_message = "cluster_autoscaler_worker_ip_pool is required when cluster_autoscaler_enabled is true — CAPMOX has no DHCP mode, ProxmoxCluster.spec.ipv4Config must name a real static range excluded from the LAN's DHCP pool."
+  }
+}
+
+variable "cluster_autoscaler_capmox_credentials_secret_name" {
+  description = "Name of the Kubernetes Secret (namespace \"default\", keys url/token/secret) this cluster's ProxmoxCluster.spec.credentialsRef points at, so CAPMOX reconciles this object using per-cluster credentials instead of falling back to its manager-wide capmox-manager-credentials Secret. That manager-wide Secret is deliberately baked with non-functional placeholder values (see kube-image/packer/proxmox/build.sh) — real Proxmox API credentials must never be baked into a VM image, so they are delivered into this named Secret at runtime by the consumer repo (e.g. an External Secrets Operator ExternalSecret pulling from a vault), never by this module or genesis. This module only references the name; creating the Secret is the caller's responsibility, and must happen before or shortly after genesis for CAPMOX to actually authenticate (it retries, so a late-arriving Secret is a delay, not a fatal error)."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = !var.cluster_autoscaler_enabled || var.cluster_autoscaler_capmox_credentials_secret_name != null
+    error_message = "cluster_autoscaler_capmox_credentials_secret_name is required when cluster_autoscaler_enabled is true — without it this ProxmoxCluster would fall back to CAPMOX's manager-wide credentials Secret, which is deliberately non-functional (kube-image bakes it with placeholder values to avoid leaking real credentials into every VM image)."
+  }
 }

@@ -1,53 +1,187 @@
-# terraform-proxmox-kube-compute
+> **Release mirror, generated -- do not edit here.** Built from
+> [kube-compute](https://github.com/bbaliyan/kube-compute)'s `modules/proxmox-cluster` and the
+> modules it uses, on every kube-compute release that changes them. Issues and pull requests
+> go to kube-compute. Published on the OpenTofu Registry as `bbaliyan/kube-compute/proxmox`.
+>
+> | Module | Built from |
+> |---|---|
+> | `.` | `modules/proxmox-cluster` |
+> | `modules/node-bootstrap` | `modules/node-bootstrap` |
+> | `modules/node-os-patch` | `modules/node-os-patch` |
+> | `modules/control-plane` | `modules/proxmox-control-plane` |
+> | `modules/node-pool` | `modules/proxmox-node-pool` |
+> | `modules/dns-registration` | `modules/dns-registration` |
 
-This repository is a **generated, read-only release mirror**. It contains the
-Proxmox-provider slice of [kube-compute](https://github.com/bbaliyan/kube-compute),
-published here on every `kube-compute` release that changes Proxmox-related code.
+# proxmox-cluster
 
-**Do not open issues or pull requests against this repo** — it is a build artifact,
-not a place where development happens. Issues and PRs are disabled here for exactly
-this reason. File bugs, feature requests, and changes against
-[kube-compute](https://github.com/bbaliyan/kube-compute) instead.
+A thin wrapper that composes [`proxmox-control-plane`](../proxmox-control-plane/README.md)
+and [`proxmox-node-pool`](../proxmox-node-pool/README.md) into a single Terraform state,
+for operators who want one Terragrunt directory per cluster instead of today's split
+`control-plane/` + `node-pools/*` layout. It changes nothing about either composed
+module internally — it only calls them from one place.
 
-This repo's commit history is a simple, append-only sequence of one commit per
-release (`release: vX.Y.Z`) — it is never rewritten or force-pushed, so a local
-clone never diverges from `origin`.
+## Single state, single lock
 
-## License
+This module puts the control plane and every worker pool in **one Terraform state
+with one lock**. That buys a single `terragrunt apply` per cluster, at a real cost:
+you can no longer apply `control-plane` and a node pool concurrently from separate
+terminals — every change serializes through the one state/lock. If your workflow
+depends on applying a worker pool while a separate control-plane change is in
+flight, stay on the split `proxmox-control-plane` + `proxmox-node-pool` layout
+instead (see below).
 
-Apache-2.0 — see `LICENSE`/`NOTICE`. Same license as `kube-compute`.
+## Inputs
 
-## Usage
+Every input `proxmox-control-plane` accepts is available unchanged — same name,
+type, default, and validation — at this module's own top level. See
+[`proxmox-control-plane`'s README](../proxmox-control-plane/README.md) and its
+`variables.tf` for the full list and field-by-field semantics; this module does not
+re-document them.
 
-Both options below resolve to *this* repo only — never to the private
-`kube-compute` monorepo, which isn't publicly consumable. The registry address's
-middle segment (`kube-compute`) is just this repo's *name* component under
-OpenTofu's `terraform-<target>-<name>` naming convention, not a reference to
-that other repo.
+`node_pools` is a map of worker pools keyed by pool name (e.g. `"platform"`). Each
+entry's fields mirror `proxmox-node-pool`'s own `variables.tf`, minus what this module
+supplies: `cluster_name`, `cluster_agent_token`, and the key itself as `pool_name`. An
+empty map (the default) creates no worker pools, the same shape as applying
+`proxmox-control-plane` alone.
+
+Every worker of a pool is named `<cluster_name>-<pool>-<n>` and carries
+`kube-compute.io/node-group=<pool>`. `node_taints` keeps other pods off; pods that
+belong there need a matching toleration. A pool field left null takes the cluster's own
+value: `trusted_ca_pem`, `registry_mirror_url`, `ssh_authorized_keys`, `dns_servers`,
+`vm_gateway`, and the DNS registration settings.
+
+## Platform pool
+
+`platform_node_group` names the pool that runs the platform stack:
+
+- its components are pinned to that pool;
+- it alone opens `ingress_ports` to `allowed_ingress_cidrs`, since Traefik runs there,
+  and the control plane keeps only 6443;
+- the wildcard DNS record points at its workers.
+
+Without it, ingress and the wildcard record stay on the control plane of an
+`all_in_one` cluster, and on the pools of a `dedicated_control_plane` one.
+
+### DNS registration
+
+Unlike some earlier revisions of this module, there's no `provider "dns" {}` to
+wire up — DNS registration (`dns_server_address`/`tsig_key_*`) is plain module
+input, and the underlying `dns-registration` module shells out to `nsupdate`
+rather than using a Terraform provider (see its README for why). It just needs
+`nsupdate` (`bind-utils`/`dnsutils`) installed on whatever machine runs
+`tofu apply`/`tofu destroy`.
+
+## Usage: control-plane only, no worker pools
 
 ```hcl
-module "control_plane" {
-  # Option 1: OpenTofu Registry (once published) — resolves to this repo's
-  # root module. No hostname prefix needed for the public registry.
-  source  = "bbaliyan/kube-compute/proxmox"
-  version = "~> 0.1"
+module "cluster" {
+  source = "path/to/kube-compute/modules/proxmox-cluster"
 
-  # Option 2: pin a git ref against this repo directly instead:
-  #   source = "github.com/bbaliyan/terraform-proxmox-kube-compute?ref=<tag>"
-
-  cluster_name        = "example"
-  control_plane_count = 1
-  # ...see variables.tf for the full input set
-}
-
-module "node_pool" {
-  # Nested submodules use the registry's // convention, same version constraint
-  # as the root module above — still this repo's modules/node-pool/:
-  source  = "bbaliyan/kube-compute/proxmox//modules/node-pool"
-  version = "~> 0.1"
-  # ...see modules/node-pool/variables.tf for the full input set
+  cluster_name          = "example"
+  proxmox_node           = "pve-01"
+  vm_cores               = 4
+  vm_memory_mb            = 8192
+  vm_disk_gb              = 60
+  allowed_ingress_cidrs   = ["10.0.0.0/24"]
+  proxmox_template_vm_id  = 9000
 }
 ```
 
-See `variables.tf`/`outputs.tf` in this repo's root (the control-plane module) and
-under `modules/node-pool/` for the full input/output contract.
+This is equivalent to today's `control-plane/` unit alone — `node_pools` defaults to
+`{}`, so no `proxmox-node-pool` instances are created.
+
+## Usage: control plane plus a worker pool
+
+```hcl
+module "cluster" {
+  source = "path/to/kube-compute/modules/proxmox-cluster"
+
+  cluster_name           = "example"
+  cluster_type           = "dedicated_control_plane"
+  proxmox_node           = "pve-01"
+  vm_cores               = 4
+  vm_memory_mb           = 8192
+  vm_disk_gb             = 60
+  allowed_ingress_cidrs  = ["10.0.0.0/24"]
+  proxmox_template_vm_id = 9000
+  cluster_network_cidr   = "10.0.0.0/24"
+  platform_node_group    = "platform"
+
+  node_pools = {
+    platform = {
+      proxmox_node           = "pve-01"
+      vm_cores               = 4
+      vm_memory_mb           = 16384
+      vm_disk_gb             = 100
+      proxmox_template_vm_id = 9000
+      desired_count          = 1
+      registration_address   = "10.0.0.5"
+    }
+    batch = {
+      proxmox_node           = "pve-01"
+      vm_cores               = 8
+      vm_memory_mb           = 32768
+      vm_disk_gb             = 100
+      proxmox_template_vm_id = 9000
+      desired_count          = 2
+      registration_address   = "10.0.0.5"
+      node_taints            = ["dedicated=batch:NoSchedule"]
+    }
+  }
+}
+```
+
+Each key in `node_pools` becomes one `proxmox-node-pool` instance, wired to this
+cluster's `cluster_name` and `cluster_agent_token` automatically.
+
+## Cluster autoscaler (optional)
+
+This module — not `proxmox-control-plane` or `node-bootstrap` — owns
+`cluster_autoscaler_enabled`, `cluster_autoscaler_worker_min_size`,
+`cluster_autoscaler_worker_max_size`, and `cluster_autoscaler_worker_template`.
+`false` (the default) is a no-op: no CAPI install, no `MachineDeployment`, no
+change to what this module already provisions.
+
+When enabled, this module:
+
+- Renders a `Cluster` + `Secret` + `ProxmoxMachineTemplate` + `MachineDeployment`
+  bundle (`templates/cluster-autoscaler-workers.yaml.tftpl`) — no
+  `RKE2ConfigTemplate`/CAPRKE2 anywhere in it. Workers join via a plain `Secret`
+  referenced by `Machine.spec.bootstrap.dataSecretName`; the `Secret`'s content
+  is this project's own worker cloud-init, rendered by a second, dedicated
+  `node-bootstrap` instantiation (`module.cluster_autoscaler_worker_bootstrap`,
+  `set_hostname = false` — the payload is shared byte-for-byte across every
+  `MachineDeployment` replica, so it cannot carry a node-unique hostname;
+  CAPMOX's own per-VM metadata is relied on instead, unverified against real
+  hardware).
+- Passes the rendered bundle through to `proxmox-control-plane` as a single
+  `genesis_apply_manifests` entry (a generic node-bootstrap mechanism — see
+  [`node-bootstrap`'s README](../node-bootstrap/README.md#genesis-apply-manifests-generic-cluster-autoscaler-is-the-one-caller-today)),
+  with `cluster_autoscaler_crd_wait_enabled = true` so `bootstrap.sh` waits for
+  CAPI's core CRDs before applying it. `proxmox-control-plane`/`node-bootstrap`
+  have no cluster-autoscaler-specific code left in them.
+  `proxmox_template_vm_id` for `cluster_autoscaler_worker_template` points at
+  the **same** kube-image template used everywhere else in this module — only
+  one image variant exists.
+- Merges a `clusterAutoscalerEnabled` Helm parameter into
+  `platform_extra_helm_parameters`, which is what gates kube-platform's own
+  `cluster-autoscaler` Argo CD Application.
+- Requires `cluster_domain` and `dns_server_address` to both be set — autoscaled
+  workers join through the genesis node's self-registered DNS name
+  (`genesis.<cluster_name>.<cluster_domain>`), the same single-target address
+  `proxmox-node-pool`'s own workers default to, computed independently here to
+  avoid a dependency cycle through the control plane's own cloud-init render.
+  Enforced by a `check` block, not a hard `plan`-time error.
+
+`cluster_autoscaler_worker_max_size` must be greater than its `0` default, and
+`cluster_autoscaler_worker_template` must be set; both are enforced by `plan`-time
+validation so an incomplete configuration fails with a clear error rather than
+producing a `MachineDeployment` that can never scale.
+
+## Existing standalone modules remain fully supported
+
+`proxmox-control-plane` and `proxmox-node-pool` are unchanged and continue to work
+exactly as before, applied as separate Terragrunt units with a `dependency` block
+carrying `cluster_agent_token` between them. `proxmox-cluster` is an additional
+option for consumers who want a single directory/state per cluster — it does not
+deprecate, replace, or require migrating the split layout.

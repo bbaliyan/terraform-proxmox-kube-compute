@@ -1,525 +1,295 @@
 # SPDX-License-Identifier: Apache-2.0
-module "component_versions" {
-  source = "./modules/component-versions"
-}
 
 locals {
-  cloud_init_template = coalesce(var.cloud_init_template, "${path.module}/modules/cloud-init/templates/cloud-init-ubuntu-2604.yaml.tpl")
+  # kube-platform's bootstrap chart gates the cluster-autoscaler Argo CD
+  # Application on this Helm value. This module owns
+  # cluster_autoscaler_enabled, so it injects it via node-bootstrap's generic
+  # platform_extra_helm_parameters map rather than a dedicated parameter.
+  platform_extra_helm_parameters = merge(
+    var.platform_extra_helm_parameters,
+    { clusterAutoscalerEnabled = tostring(var.cluster_autoscaler_enabled) },
+  )
 
-  # Falls back to the platform-wide default when the caller doesn't override k8s_version.
-  k8s_version = coalesce(var.k8s_version, module.component_versions.k8s_version)
-
-  has_domain    = var.cluster_domain != null
-  fqdn_suffix   = local.has_domain ? "${var.cluster_name}.${var.cluster_domain}" : null
-  cluster_fqdn  = local.has_domain ? "api.${local.fqdn_suffix}" : null
-  wildcard_name = local.has_domain ? "*.${local.fqdn_suffix}" : null
-
-  control_plane_taint              = var.cluster_type == "dedicated_control_plane"
-  effective_cni                    = var.cni != null ? var.cni : (var.control_plane_count > 1 ? "cilium" : "flannel")
-  effective_etcd_snapshots_enabled = var.etcd_snapshots_enabled != null ? var.etcd_snapshots_enabled : var.control_plane_count > 1
-
-  # Null for control_plane_count = 1 (no registration endpoint), the VIP otherwise.
-  registration_address = var.control_plane_count == 1 ? null : var.control_plane_vip_address
-
-  cluster_ipset_name = "kube-compute-${var.cluster_name}-cluster"
-  etcd_ipset_name    = "kube-compute-${var.cluster_name}-etcd"
-
-  # One IP per control-plane node; index 0 is genesis. DHCP only when control_plane_count = 1
-  # and control_plane_ip_addresses was left null (parity with node-proxmox's existing default).
-  static_ips  = var.control_plane_ip_addresses != null
-  cp_ip_cidrs = local.static_ips ? var.control_plane_ip_addresses : []
-
-  _dns_list = join(", ", var.dns_servers)
-
-  # Netplan v2 network-config, one per control-plane index. OpenTofu forbids heredocs inside
-  # ternaries, so both branches are precomputed and selected per-index below.
-  network_data_static = { for i, cidr in local.cp_ip_cidrs : i => <<-EOT
-    version: 2
-    ethernets:
-      primary:
-        match:
-          name: "en*"
-        addresses:
-          - ${cidr}
-        routes:
-          - to: default
-            via: ${var.vm_gateway}
-        nameservers:
-          addresses: [${local._dns_list}]
-        dhcp4: false
-    EOT
-  }
-  network_data_dhcp = <<-EOT
-    version: 2
-    ethernets:
-      primary:
-        match:
-          name: "en*"
-        dhcp4: true
-    EOT
-}
-
-# ---- Join-token flow: pre-generated so a control plane + pool join in one apply pass ----
-resource "random_password" "server_token" {
-  length  = 48
-  special = false
-}
-
-resource "random_password" "agent_token" {
-  length  = 48
-  special = false
-}
-
-# ---- Cluster firewall: an ipset scoped to the cluster's L2 subnet CIDR (see plan design note 2) ----
-resource "proxmox_virtual_environment_firewall_ipset" "cluster" {
-  name    = local.cluster_ipset_name
-  comment = "kube-compute ${var.cluster_name}: east-west traffic among cluster members (subnet-scoped — see module README)."
-
-  cidr {
-    name = coalesce(var.cluster_network_cidr, "${split("/", coalesce(try(var.control_plane_ip_addresses[0], null), "0.0.0.0/32"))[0]}/32")
-  }
-}
-
-# ---- etcd firewall: exact control-plane IPs only, never joined by workers ----
-resource "proxmox_virtual_environment_firewall_ipset" "etcd" {
-  name    = local.etcd_ipset_name
-  comment = "kube-compute ${var.cluster_name}: etcd peer/client traffic, control-plane nodes only."
-
-  dynamic "cidr" {
-    for_each = var.control_plane_count > 1 ? [for ip in var.control_plane_ip_addresses : "${split("/", ip)[0]}/32"] : ["${local.cp_ips["0"]}/32"]
-    content {
-      name = cidr.value
-    }
-  }
-}
-
-resource "proxmox_download_file" "os_image" {
-  count = var.os_image_url != null ? 1 : 0
-
-  content_type        = "import"
-  datastore_id        = var.iso_datastore_id
-  node_name           = var.proxmox_node
-  url                 = var.os_image_url
-  file_name           = coalesce(var.os_image_file_name, basename(var.os_image_url))
-  overwrite_unmanaged = false
-
-  lifecycle {
-    precondition {
-      condition     = var.os_image_file_name != null || !endswith(var.os_image_url, ".img")
-      error_message = "os_image_url ends in '.img' which Proxmox rejects as an import extension. Set os_image_file_name to a .qcow2 filename."
-    }
-  }
-}
-
-resource "proxmox_virtual_environment_file" "vendor_data" {
-  content_type = "snippets"
-  datastore_id = var.iso_datastore_id
-  node_name    = var.proxmox_node
-
-  source_raw {
-    data = join("\n", concat(
-      ["#cloud-config", "packages:", "  - qemu-guest-agent"],
-      var.ssh_authorized_keys != null ? concat(
-        ["ssh_authorized_keys:"],
-        [for k in var.ssh_authorized_keys : "  - ${trimspace(k)}"]
-      ) : [],
-      ["runcmd:", "  - systemctl enable --now qemu-guest-agent", "  - systemctl enable --now serial-getty@ttyS0.service", ""]
-    ))
-    file_name = "${var.cluster_name}-vendor-data.yaml"
-  }
-}
-
-locals {
-  kube_vip_manifest = var.control_plane_count == 1 ? null : <<-EOT
-    apiVersion: v1
-    kind: ServiceAccount
-    metadata:
-      name: kube-vip
-      namespace: kube-system
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: ClusterRole
-    metadata:
-      name: system:kube-vip-role
-    rules:
-      - apiGroups: [""]
-        resources: ["services", "services/status", "nodes", "endpoints", "configmaps"]
-        verbs: ["list", "get", "watch", "update", "create"]
-      - apiGroups: ["coordination.k8s.io"]
-        resources: ["leases"]
-        verbs: ["list", "get", "watch", "update", "create"]
-    ---
-    apiVersion: rbac.authorization.k8s.io/v1
-    kind: ClusterRoleBinding
-    metadata:
-      name: system:kube-vip-binding
-    roleRef:
-      apiGroup: rbac.authorization.k8s.io
-      kind: ClusterRole
-      name: system:kube-vip-role
-    subjects:
-      - kind: ServiceAccount
-        name: kube-vip
-        namespace: kube-system
-    ---
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata:
-      name: kube-vip-ds
-      namespace: kube-system
-    spec:
-      selector:
-        matchLabels:
-          name: kube-vip-ds
-      template:
-        metadata:
-          labels:
-            name: kube-vip-ds
-        spec:
-          serviceAccountName: kube-vip
-          tolerations:
-            - key: CriticalAddonsOnly
-              operator: Exists
-            - effect: NoSchedule
-              operator: Exists
-            - effect: NoExecute
-              operator: Exists
-          hostNetwork: true
-          containers:
-            - name: kube-vip
-              # renovate: datasource=docker depName=ghcr.io/kube-vip/kube-vip
-              image: ghcr.io/kube-vip/kube-vip:v0.8.9
-              imagePullPolicy: IfNotPresent
-              args: ["manager"]
-              env:
-                - name: vip_arp
-                  value: "true"
-                - name: port
-                  value: "6443"
-                - name: vip_cidr
-                  value: "32"
-                - name: cp_enable
-                  value: "true"
-                - name: cp_namespace
-                  value: "kube-system"
-                - name: vip_ddns
-                  value: "false"
-                - name: svc_enable
-                  value: "false"
-                - name: vip_leaderelection
-                  value: "true"
-                - name: vip_leaseduration
-                  value: "5"
-                - name: vip_renewdeadline
-                  value: "3"
-                - name: vip_retryperiod
-                  value: "1"
-                - name: address
-                  value: "${var.control_plane_vip_address}"
-              securityContext:
-                capabilities:
-                  add: ["NET_ADMIN", "NET_RAW"]
-  EOT
-}
-
-module "bootstrap" {
-  source = "./modules/cloud-init"
-
-  cloud_init_template            = local.cloud_init_template
-  cluster_name                   = var.cluster_name
-  node_name                      = "${var.cluster_name}-cp-0"
-  k8s_version                    = local.k8s_version
-  cluster_fqdn                   = local.cluster_fqdn
-  node_role                      = "server-init"
-  control_plane_taint            = local.control_plane_taint
-  cni                            = local.effective_cni
-  cluster_token                  = random_password.server_token.result
-  cluster_agent_token            = random_password.agent_token.result
-  registration_address           = local.registration_address
-  extra_tls_sans                 = [for v in [local.registration_address, local.wildcard_name] : v if v != null]
-  etcd_snapshot_enabled          = local.effective_etcd_snapshots_enabled
-  etcd_snapshot_schedule_cron    = var.etcd_snapshot_schedule_cron
-  etcd_snapshot_retention        = var.etcd_snapshot_retention
-  extra_server_manifests         = local.kube_vip_manifest != null ? { "kube-vip.yaml" = local.kube_vip_manifest } : {}
-  trusted_ca_pem                 = var.trusted_ca_pem
-  registry_mirror_url            = var.registry_mirror_url
-  gitops_platform_repo_url       = var.gitops_platform_repo_url
-  gitops_platform_revision       = var.gitops_platform_revision
-  gitops_workloads_repo_url      = var.gitops_workloads_repo_url
-  gitops_workloads_revision      = var.gitops_workloads_revision
-  gitops_workloads_path          = var.gitops_workloads_path
-  cert_mode                      = var.cert_mode
-  platform_extra_helm_parameters = var.platform_extra_helm_parameters
-  platform_helm_values_object    = var.platform_helm_values_object
-  extra_tags                     = var.extra_tags
-}
-
-module "bootstrap_additional" {
-  for_each = var.control_plane_count > 1 ? { for i in range(1, var.control_plane_count) : tostring(i) => i } : {}
-
-  source = "./modules/cloud-init"
-
-  cloud_init_template         = local.cloud_init_template
-  cluster_name                = var.cluster_name
-  node_name                   = "${var.cluster_name}-cp-${each.key}"
-  k8s_version                 = local.k8s_version
-  cluster_fqdn                = local.cluster_fqdn
-  node_role                   = "server-join"
-  control_plane_taint         = local.control_plane_taint
-  cni                         = local.effective_cni
-  registration_address        = local.registration_address
-  extra_tls_sans              = [for v in [local.registration_address, local.wildcard_name] : v if v != null]
-  etcd_snapshot_enabled       = local.effective_etcd_snapshots_enabled
-  etcd_snapshot_schedule_cron = var.etcd_snapshot_schedule_cron
-  etcd_snapshot_retention     = var.etcd_snapshot_retention
-  extra_server_manifests      = local.kube_vip_manifest != null ? { "kube-vip.yaml" = local.kube_vip_manifest } : {}
-  cluster_token               = random_password.server_token.result
-  trusted_ca_pem              = var.trusted_ca_pem
-  registry_mirror_url         = var.registry_mirror_url
-  cert_mode                   = var.cert_mode
-  extra_tags                  = var.extra_tags
-  # gitops_* intentionally omitted: Argo/platform bootstrap runs on the first server only.
-}
-
-resource "proxmox_virtual_environment_file" "network_data" {
-  for_each = local.static_ips ? { for i in range(var.control_plane_count) : tostring(i) => i } : {}
-
-  content_type = "snippets"
-  datastore_id = var.iso_datastore_id
-  node_name    = var.proxmox_node
-  overwrite    = true
-
-  source_raw {
-    file_name = "${var.cluster_name}-cp-${each.key}-network-data.yaml"
-    data      = local.network_data_static[each.value]
-  }
-}
-
-resource "proxmox_virtual_environment_file" "network_data_dhcp" {
-  count = local.static_ips ? 0 : 1
-
-  content_type = "snippets"
-  datastore_id = var.iso_datastore_id
-  node_name    = var.proxmox_node
-  overwrite    = true
-
-  source_raw {
-    file_name = "${var.cluster_name}-cp-0-network-data.yaml"
-    data      = local.network_data_dhcp
-  }
-}
-
-resource "proxmox_virtual_environment_file" "cloud_init" {
-  content_type = "snippets"
-  datastore_id = var.iso_datastore_id
-  node_name    = var.proxmox_node
-
-  source_raw {
-    data      = module.bootstrap.cloud_init
-    file_name = "${var.cluster_name}-cp-0-cloud-init.yaml"
-  }
-}
-
-resource "proxmox_virtual_environment_file" "cloud_init_additional" {
-  for_each = module.bootstrap_additional
-
-  content_type = "snippets"
-  datastore_id = var.iso_datastore_id
-  node_name    = var.proxmox_node
-
-  source_raw {
-    data      = each.value.cloud_init
-    file_name = "${var.cluster_name}-cp-${each.key}-cloud-init.yaml"
-  }
-}
-
-resource "proxmox_virtual_environment_vm" "control_plane" {
-  name            = "${var.cluster_name}-cp-0"
-  node_name       = var.proxmox_node
-  tags            = ["kube-compute", var.cluster_name, "control-plane"]
-  on_boot         = true
-  started         = true
-  stop_on_destroy = true
-  tablet_device   = false
-  scsi_hardware   = "virtio-scsi-single"
-
-  agent {
-    enabled = true
-    timeout = "15m"
-    trim    = true
-  }
-
-  cpu {
-    cores = var.vm_cores
-    type  = var.vm_cpu_type
-  }
-
-  memory {
-    dedicated = var.vm_memory_mb
-  }
-
-  disk {
-    datastore_id = var.disk_datastore_id
-    import_from  = var.os_image_url != null ? one(proxmox_download_file.os_image[*].id) : var.os_image_file_id
-    file_id      = null
-    interface    = "scsi0"
-    size         = var.vm_disk_gb
-    discard      = "on"
-    iothread     = true
-    ssd          = true
-  }
-
-  serial_device {}
-
-  network_device {
-    bridge = var.network_bridge
-    model  = "virtio"
-    queues = var.vm_cores
-  }
-
-  operating_system {
-    type = "l26"
-  }
-
-  initialization {
-    datastore_id         = var.disk_datastore_id
-    user_data_file_id    = proxmox_virtual_environment_file.cloud_init.id
-    vendor_data_file_id  = proxmox_virtual_environment_file.vendor_data.id
-    network_data_file_id = local.static_ips ? proxmox_virtual_environment_file.network_data["0"].id : proxmox_virtual_environment_file.network_data_dhcp[0].id
-  }
-
-  lifecycle {
-    precondition {
-      condition     = (var.os_image_url != null) != (var.os_image_file_id != null)
-      error_message = "Set exactly one of os_image_url (download) or os_image_file_id (pre-existing Proxmox file)."
-    }
-  }
-}
-
-resource "proxmox_virtual_environment_vm" "control_plane_additional" {
-  for_each = module.bootstrap_additional
-
-  name            = "${var.cluster_name}-cp-${each.key}"
-  node_name       = var.proxmox_node
-  tags            = ["kube-compute", var.cluster_name, "control-plane"]
-  on_boot         = true
-  started         = true
-  stop_on_destroy = true
-  tablet_device   = false
-  scsi_hardware   = "virtio-scsi-single"
-
-  agent {
-    enabled = true
-    timeout = "15m"
-    trim    = true
-  }
-
-  cpu {
-    cores = var.vm_cores
-    type  = var.vm_cpu_type
-  }
-
-  memory {
-    dedicated = var.vm_memory_mb
-  }
-
-  disk {
-    datastore_id = var.disk_datastore_id
-    import_from  = var.os_image_url != null ? one(proxmox_download_file.os_image[*].id) : var.os_image_file_id
-    file_id      = null
-    interface    = "scsi0"
-    size         = var.vm_disk_gb
-    discard      = "on"
-    iothread     = true
-    ssd          = true
-  }
-
-  serial_device {}
-
-  network_device {
-    bridge = var.network_bridge
-    model  = "virtio"
-    queues = var.vm_cores
-  }
-
-  operating_system {
-    type = "l26"
-  }
-
-  initialization {
-    datastore_id         = var.disk_datastore_id
-    user_data_file_id    = proxmox_virtual_environment_file.cloud_init_additional[each.key].id
-    vendor_data_file_id  = proxmox_virtual_environment_file.vendor_data.id
-    network_data_file_id = proxmox_virtual_environment_file.network_data[each.key].id
-  }
-
-  depends_on = [proxmox_virtual_environment_vm.control_plane]
-}
-
-locals {
-  # Resolved IP per control-plane VM, static or via guest agent — same pattern node-proxmox uses.
-  cp_ips = merge(
+  platform_helm_values_object = merge(
+    var.platform_helm_values_object,
     {
-      "0" = local.static_ips ? split("/", var.control_plane_ip_addresses[0])[0] : try(
-        [for ip in flatten(proxmox_virtual_environment_vm.control_plane.ipv4_addresses) : ip if !startswith(ip, "127.")][0], null
-      )
+      for pool in var.platform_node_group == null ? [] : [var.platform_node_group] :
+      "platformNodeSelector" => { "kube-compute.io/node-group" = pool }
     },
+  )
+
+  # Ingress runs with the platform, so its pool alone answers on the ingress ports;
+  # the control plane keeps only the Kubernetes API.
+  control_plane_ingress_ports = var.platform_node_group == null ? var.ingress_ports : [for p in var.ingress_ports : p if p == 6443]
+  platform_ingress_ports      = [for p in var.ingress_ports : p if p != 6443]
+
+  # ---- cluster-autoscaler-workers.yaml (Cluster + Secret + ProxmoxMachineTemplate + MachineDeployment) ----
+  # See templates/cluster-autoscaler-workers.yaml.tftpl for field-source
+  # commentary. vm_memory_mb -> memoryMiB: despite the "_mb" name, this
+  # variable is already MiB project-wide (see its own description, "RAM per
+  # ... VM in MiB" — same convention as proxmox-control-plane's and
+  # proxmox-node-pool's own vm_memory_mb, and the same value bpg/proxmox's
+  # `memory { dedicated = ... }` block consumes directly). A prior revision
+  # of this local ran it through a decimal-MB(10^6)-to-MiB(2^20) conversion
+  # formula anyway, silently corrupting e.g. 8192 -> 7813 — caught on a real
+  # apply: CAPMOX's CRD validation rejects non-multiple-of-8 memoryMiB
+  # values outright ("spec.template.spec.memoryMiB: Invalid value: 7813
+  # ... should be a multiple of 8"). No conversion is needed; pass the value
+  # straight through, matching every other vm_memory_mb consumer in this
+  # project.
+  cluster_autoscaler_bundle_yaml = !var.cluster_autoscaler_enabled ? "" : templatefile(
+    "${path.module}/templates/cluster-autoscaler-workers.yaml.tftpl",
     {
-      for k, vm in proxmox_virtual_environment_vm.control_plane_additional :
-      k => local.static_ips ? split("/", var.control_plane_ip_addresses[tonumber(k)])[0] : try(
-        [for ip in flatten(vm.ipv4_addresses) : ip if !startswith(ip, "127.")][0], null
-      )
+      cluster_name           = var.cluster_name
+      min_size               = var.cluster_autoscaler_worker_min_size
+      max_size               = var.cluster_autoscaler_worker_max_size
+      vm_cores               = var.cluster_autoscaler_worker_template.vm_cores
+      vm_memory_mib          = var.cluster_autoscaler_worker_template.vm_memory_mb
+      vm_disk_gb             = var.cluster_autoscaler_worker_template.vm_disk_gb
+      proxmox_node           = var.cluster_autoscaler_worker_template.proxmox_node
+      proxmox_template_vm_id = var.cluster_autoscaler_worker_template.proxmox_template_vm_id
+      disk_datastore_id      = var.cluster_autoscaler_worker_template.disk_datastore_id
+      network_bridge         = var.cluster_autoscaler_worker_template.network_bridge
+      dns_servers            = var.dns_servers
+      ip_pool_addresses      = var.cluster_autoscaler_enabled ? var.cluster_autoscaler_worker_ip_pool.addresses : []
+      ip_pool_gateway        = var.cluster_autoscaler_enabled ? var.cluster_autoscaler_worker_ip_pool.gateway : ""
+      ip_pool_prefix         = var.cluster_autoscaler_enabled ? var.cluster_autoscaler_worker_ip_pool.prefix : 0
+      ip_pool_metric         = var.cluster_autoscaler_enabled ? var.cluster_autoscaler_worker_ip_pool.metric : 0
+      # ProxmoxCluster.spec.controlPlaneEndpoint.host rejects an empty/unset
+      # value outright ("provided endpoint address is not a valid IP or
+      # FQDN") — confirmed on a real apply. This ProxmoxCluster is a
+      # Get()-satisfying placeholder only (see the big comment in the
+      # template on why Cluster.spec.controlPlaneRef is deliberately
+      # omitted), so its value is never actually consulted for anything
+      # actionable here — reusing cluster_autoscaler_registration_address
+      # (the same genesis self-registered DNS name autoscaler workers
+      # already join through) keeps it real/resolvable without introducing
+      # the module.control_plane.cluster_ip/cluster_fqdn dependency cycle
+      # that local's own comment documents. 6443 is RKE2/Kubernetes' standard
+      # API server port — this project never overrides it.
+      # coalesce, not the bare local: cluster_domain/dns_server_address unset
+      # (with cluster_autoscaler_enabled = true) is already a hard error via
+      # the terraform_data.cluster_autoscaler_registration_address_configured
+      # precondition below, but that precondition and this templatefile()
+      # call both evaluate in the same plan — a bare null here would crash
+      # templatefile() itself ("Cannot include a null value in a string
+      # template") before OpenTofu gets to report the precondition's own,
+      # more actionable error message. The empty-string fallback is never a
+      # real value an actual apply reaches (the precondition blocks it).
+      control_plane_endpoint_host = local.cluster_autoscaler_registration_address != null ? local.cluster_autoscaler_registration_address : ""
+      control_plane_endpoint_port = 6443
+      bootstrap_secret_b64        = var.cluster_autoscaler_enabled ? base64encode(module.cluster_autoscaler_worker_bootstrap[0].cloud_init_user_data) : ""
+      # Never the manager-wide capmox-manager-credentials fallback — see
+      # variables.tf's own description and the template's UNVERIFIED-item-4
+      # comment for why. Empty string is unreachable at apply time: the
+      # variable's own validation blocks null here whenever
+      # cluster_autoscaler_enabled is true.
+      capmox_credentials_secret_name = coalesce(var.cluster_autoscaler_capmox_credentials_secret_name, "")
     }
   )
 
-  all_cp_vm_ids = merge(
-    { "0" = proxmox_virtual_environment_vm.control_plane.vm_id },
-    { for k, vm in proxmox_virtual_environment_vm.control_plane_additional : k => vm.vm_id }
-  )
+  genesis_apply_manifests = !var.cluster_autoscaler_enabled ? [] : [{
+    path    = "/opt/kube-compute/manifests/20-cluster-autoscaler-workers.yaml"
+    content = local.cluster_autoscaler_bundle_yaml
+  }]
+
+  # Deliberately NOT module.control_plane.cluster_fqdn/cluster_ip: this
+  # bundle's Secret is written into the CONTROL PLANE's own cloud-init
+  # (genesis_apply_manifests, below), so referencing either output would
+  # create a dependency cycle (cluster_ip resolves from the control-plane VM
+  # resource, which needs this bundle's cloud-init rendered first). Instead
+  # this mirrors proxmox-node-pool's own default: the genesis node's
+  # single-target self-registered DNS name, computed from this module's own
+  # cluster_domain/dns_server_address, no control_plane output involved.
+  # Requires both variables set — validated below. cluster_fqdn (the
+  # round-robin api.* record) is avoided even where it wouldn't cycle: it
+  # causes 10-20+ minute join hangs (see proxmox-node-pool's
+  # registration_address doc).
+  cluster_autoscaler_registration_address = var.cluster_domain != null && var.dns_server_address != null ? (
+    "genesis.${var.cluster_name}.${trimsuffix(var.cluster_domain, ".")}"
+  ) : null
 }
 
-resource "proxmox_virtual_environment_firewall_options" "control_plane" {
-  for_each = local.all_cp_vm_ids
+# Shared worker cloud-init payload for every CAPI-provisioned autoscaler
+# Machine: rendered once, referenced by every MachineDeployment replica via
+# the same Secret (Machine.spec.bootstrap.dataSecretName) — not one
+# node-bootstrap instantiation per replica, since CAPMOX/cluster-autoscaler
+# (not this module) creates the actual VMs. set_hostname = false: the payload
+# is shared byte-for-byte across replicas, so it cannot carry a node-unique
+# hostname — see node-bootstrap's set_hostname variable for the still-
+# unverified assumption this relies on (CAPMOX's per-VM cloud-init metadata
+# supplying a usable hostname instead). node_name is still required by the
+# interface even though set_hostname = false means it's never written to
+# cloud-config — purely a Terraform-internal label, need not be unique.
+# agent_token_fetch_command mirrors proxmox-node-pool's own module call:
+# every worker replica in a pool gets byte-identical values, which is why a
+# single shared render works here too. cluster_agent_token is safe to read
+# from module.control_plane (unlike cluster_fqdn/cluster_ip) — it comes from
+# a random_password resource with no dependency on the control plane's own
+# cloud-init render.
+module "cluster_autoscaler_worker_bootstrap" {
+  source = "./modules/node-bootstrap"
+  count  = var.cluster_autoscaler_enabled ? 1 : 0
 
-  node_name     = var.proxmox_node
-  vm_id         = each.value
-  enabled       = true
-  dhcp          = !local.static_ips
-  input_policy  = "DROP"
-  output_policy = "ACCEPT"
+  cluster_name              = var.cluster_name
+  node_name                 = "${var.cluster_name}-autoscaler-worker"
+  node_role                 = "worker"
+  set_hostname              = false
+  registration_address      = local.cluster_autoscaler_registration_address
+  agent_token_fetch_command = "echo '${module.control_plane.cluster_agent_token}'"
+  trusted_ca_pem            = var.trusted_ca_pem
+  registry_mirror_url       = var.registry_mirror_url
+  dns_servers               = var.dns_servers
 }
 
-resource "proxmox_virtual_environment_firewall_rules" "control_plane" {
-  for_each = local.all_cp_vm_ids
+# Module calls don't support lifecycle preconditions (only resources/data
+# sources do), and a plain `check` block only warns rather than blocks at
+# apply time (a misconfigured cluster_autoscaler_enabled = true would apply
+# cleanly with a broken join address baked into every worker's Secret).
+# terraform_data is a provider-less resource that DOES support lifecycle
+# preconditions, used here purely to get a hard-stop precondition, matching
+# proxmox-node-pool's own registration_address precondition in strictness.
+resource "terraform_data" "cluster_autoscaler_registration_address_configured" {
+  count = var.cluster_autoscaler_enabled ? 1 : 0
 
-  node_name = var.proxmox_node
-  vm_id     = each.value
-
-  rule {
-    type    = "in"
-    action  = "ACCEPT"
-    source  = "+${local.cluster_ipset_name}"
-    comment = "all traffic among cluster members"
-  }
-
-  rule {
-    type    = "in"
-    action  = "ACCEPT"
-    proto   = "tcp"
-    dport   = "2379:2380"
-    source  = "+${local.etcd_ipset_name}"
-    comment = "etcd peer/client traffic, control-plane nodes only"
-  }
-
-  dynamic "rule" {
-    for_each = var.ingress_ports
-    content {
-      type    = "in"
-      action  = "ACCEPT"
-      proto   = "tcp"
-      dport   = tostring(rule.value)
-      source  = var.allowed_ingress_cidrs[0]
-      comment = "cluster access port ${rule.value}"
+  lifecycle {
+    precondition {
+      condition     = local.cluster_autoscaler_registration_address != null
+      error_message = "cluster_autoscaler_enabled = true requires both cluster_domain and dns_server_address to be set — autoscaled workers join through the genesis node's self-registered DNS name, computed from those two, same as proxmox-node-pool's own default registration_address."
     }
   }
+}
+
+# The CAPI-core/CAPMOX manifests bootstrap.sh applies as capi-install.yaml
+# provision their webhook TLS via cert-manager Issuer/Certificate resources —
+# a hard dependency, not cosmetic. cert-manager itself is only installed by
+# the platform Argo CD Application (kube-platform's wave-0
+# cert-manager-app.yaml), so cluster_autoscaler_enabled = true with
+# gitops_platform_enabled = false leaves capi-install.yaml with no way to
+# ever succeed (confirmed on a real apply: "no matches for kind Issuer/
+# Certificate in version cert-manager.io/v1: ensure CRDs are installed
+# first"). Fail this at plan/apply time rather than at 03:00 in a bootstrap
+# log on a booting VM.
+resource "terraform_data" "cluster_autoscaler_requires_platform_gitops" {
+  count = var.cluster_autoscaler_enabled ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition     = var.gitops_platform_enabled
+      error_message = "cluster_autoscaler_enabled = true requires gitops_platform_enabled = true — the CAPI/CAPMOX manifests it applies depend on cert-manager, which is only installed by the platform Argo CD Application."
+    }
+  }
+}
+
+module "control_plane" {
+  source = "./modules/control-plane"
+
+  ssh_private_key_file              = var.ssh_private_key_file
+  ssh_user                          = var.ssh_user
+  cluster_name                      = var.cluster_name
+  trusted_ca_pem                    = var.trusted_ca_pem
+  registry_mirror_url               = var.registry_mirror_url
+  gitops_platform_enabled           = var.gitops_platform_enabled
+  gitops_platform_repo_url_override = var.gitops_platform_repo_url_override
+  gitops_platform_revision_override = var.gitops_platform_revision_override
+  gitops_workloads_repo_url         = var.gitops_workloads_repo_url
+  gitops_workloads_revision         = var.gitops_workloads_revision
+  gitops_workloads_path             = var.gitops_workloads_path
+  workloads_extra_helm_parameters   = var.workloads_extra_helm_parameters
+  workloads_helm_values_object      = var.workloads_helm_values_object
+  cluster_type                      = var.cluster_type
+  cni                               = var.cni
+  cert_mode                         = var.cert_mode
+  platform_extra_helm_parameters    = local.platform_extra_helm_parameters
+  platform_helm_values_object       = local.platform_helm_values_object
+  extra_tags                        = var.extra_tags
+  proxmox_node                      = var.proxmox_node
+  disk_datastore_id                 = var.disk_datastore_id
+  iso_datastore_id                  = var.iso_datastore_id
+  network_bridge                    = var.network_bridge
+  vm_cores                          = var.vm_cores
+  vm_memory_mb                      = var.vm_memory_mb
+  vm_disk_gb                        = var.vm_disk_gb
+  vm_cpu_type                       = var.vm_cpu_type
+  node_arch                         = var.node_arch
+  os_image_url                      = var.os_image_url
+  os_image_file_name                = var.os_image_file_name
+  os_image_file_id                  = var.os_image_file_id
+  proxmox_template_vm_id            = var.proxmox_template_vm_id
+  ssh_authorized_keys               = var.ssh_authorized_keys
+  dns_servers                       = var.dns_servers
+  control_plane_count               = var.control_plane_count
+  control_plane_ip_addresses        = var.control_plane_ip_addresses
+  vm_gateway                        = var.vm_gateway
+  cluster_network_cidr              = var.cluster_network_cidr
+  allowed_ingress_cidrs             = var.allowed_ingress_cidrs
+  ingress_ports                     = local.control_plane_ingress_ports
+  manage_wildcard_dns_record        = var.platform_node_group == null
+  cluster_domain                    = var.cluster_domain
+  dns_server_address                = var.dns_server_address
+  dns_server_port                   = var.dns_server_port
+  dns_transport                     = var.dns_transport
+  dns_record_ttl                    = var.dns_record_ttl
+  tsig_key_name                     = var.tsig_key_name
+  tsig_key_algorithm                = var.tsig_key_algorithm
+  tsig_key_secret                   = var.tsig_key_secret
+
+  genesis_apply_manifests             = local.genesis_apply_manifests
+  cluster_autoscaler_crd_wait_enabled = var.cluster_autoscaler_enabled
+  extra_server_manifests              = var.extra_server_manifests
+}
+
+module "node_pools" {
+  source   = "./modules/node-pool"
+  for_each = var.node_pools
+
+  cluster_name        = var.cluster_name
+  pool_name           = each.key
+  cluster_agent_token = module.control_plane.cluster_agent_token
+
+  node_taints                = each.value.node_taints
+  manage_wildcard_dns_record = var.platform_node_group == null || each.key == var.platform_node_group
+  allowed_ingress_cidrs      = each.key == var.platform_node_group ? var.allowed_ingress_cidrs : []
+  ingress_ports              = each.key == var.platform_node_group ? local.platform_ingress_ports : []
+
+  # Cluster-wide by default, overridable per pool. Ternaries rather than coalesce(): both
+  # sides are commonly null, and coalesce raises when every argument is null.
+  trusted_ca_pem         = each.value.trusted_ca_pem != null ? each.value.trusted_ca_pem : var.trusted_ca_pem
+  registry_mirror_url    = each.value.registry_mirror_url != null ? each.value.registry_mirror_url : var.registry_mirror_url
+  ssh_authorized_keys    = each.value.ssh_authorized_keys != null ? each.value.ssh_authorized_keys : var.ssh_authorized_keys
+  dns_servers            = each.value.dns_servers != null ? each.value.dns_servers : var.dns_servers
+  cluster_domain         = each.value.cluster_domain != null ? each.value.cluster_domain : var.cluster_domain
+  dns_server_address     = each.value.dns_server_address != null ? each.value.dns_server_address : var.dns_server_address
+  dns_server_port        = each.value.dns_server_port != null ? each.value.dns_server_port : var.dns_server_port
+  dns_transport          = each.value.dns_transport != null ? each.value.dns_transport : var.dns_transport
+  dns_record_ttl         = each.value.dns_record_ttl != null ? each.value.dns_record_ttl : var.dns_record_ttl
+  tsig_key_name          = each.value.tsig_key_name != null ? each.value.tsig_key_name : var.tsig_key_name
+  tsig_key_algorithm     = each.value.tsig_key_algorithm != null ? each.value.tsig_key_algorithm : var.tsig_key_algorithm
+  tsig_key_secret        = each.value.tsig_key_secret != null ? each.value.tsig_key_secret : var.tsig_key_secret
+  proxmox_node           = each.value.proxmox_node
+  disk_datastore_id      = each.value.disk_datastore_id
+  iso_datastore_id       = each.value.iso_datastore_id
+  network_bridge         = each.value.network_bridge
+  vm_cores               = each.value.vm_cores
+  vm_memory_mb           = each.value.vm_memory_mb
+  vm_disk_gb             = each.value.vm_disk_gb
+  vm_cpu_type            = each.value.vm_cpu_type
+  os_image_url           = each.value.os_image_url
+  os_image_file_name     = each.value.os_image_file_name
+  os_image_file_id       = each.value.os_image_file_id
+  proxmox_template_vm_id = each.value.proxmox_template_vm_id
+  worker_ip_addresses    = each.value.worker_ip_addresses
+  vm_gateway             = each.value.vm_gateway != null ? each.value.vm_gateway : var.vm_gateway
+  desired_count          = each.value.desired_count
+  registration_address   = each.value.registration_address
+  extra_node_labels      = each.value.extra_node_labels
+}
+
+module "os_patch" {
+  source = "./modules/node-os-patch"
+
+  control_plane_node_refs = module.control_plane.control_plane_node_refs
+  worker_node_refs        = merge([for p in module.node_pools : p.worker_node_refs]...)
+  ssh_user                = module.control_plane.ssh_user
+  ssh_private_key_file    = module.control_plane.ssh_private_key_file
 }
