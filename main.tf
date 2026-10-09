@@ -106,7 +106,7 @@ locals {
   # causes 10-20+ minute join hangs (see proxmox-node-pool's
   # registration_address doc).
   cluster_autoscaler_registration_address = var.cluster_domain != null && var.dns_server_address != null ? (
-    "genesis.${var.cluster_name}.${trimsuffix(var.cluster_domain, ".")}"
+    "genesis.${coalesce(var.cluster_dns_name, var.cluster_name)}.${trimsuffix(var.cluster_domain, ".")}"
   ) : null
 }
 
@@ -140,6 +140,8 @@ module "cluster_autoscaler_worker_bootstrap" {
   trusted_ca_pem            = var.trusted_ca_pem
   registry_mirror_url       = var.registry_mirror_url
   dns_servers               = var.dns_servers
+  graceful_shutdown         = var.graceful_shutdown
+  os_auto_updates           = var.os_auto_updates
 }
 
 # Module calls don't support lifecycle preconditions (only resources/data
@@ -226,6 +228,7 @@ module "control_plane" {
   ingress_ports                     = local.control_plane_ingress_ports
   manage_wildcard_dns_record        = var.platform_node_group == null
   cluster_domain                    = var.cluster_domain
+  cluster_dns_name                  = var.cluster_dns_name
   dns_server_address                = var.dns_server_address
   dns_server_port                   = var.dns_server_port
   dns_transport                     = var.dns_transport
@@ -237,6 +240,8 @@ module "control_plane" {
   genesis_apply_manifests             = local.genesis_apply_manifests
   cluster_autoscaler_crd_wait_enabled = var.cluster_autoscaler_enabled
   extra_server_manifests              = var.extra_server_manifests
+  graceful_shutdown                   = var.graceful_shutdown
+  os_auto_updates                     = var.os_auto_updates
 }
 
 module "node_pools" {
@@ -258,6 +263,7 @@ module "node_pools" {
   registry_mirror_url    = each.value.registry_mirror_url != null ? each.value.registry_mirror_url : var.registry_mirror_url
   ssh_authorized_keys    = each.value.ssh_authorized_keys != null ? each.value.ssh_authorized_keys : var.ssh_authorized_keys
   dns_servers            = each.value.dns_servers != null ? each.value.dns_servers : var.dns_servers
+  cluster_dns_name       = var.cluster_dns_name
   cluster_domain         = each.value.cluster_domain != null ? each.value.cluster_domain : var.cluster_domain
   dns_server_address     = each.value.dns_server_address != null ? each.value.dns_server_address : var.dns_server_address
   dns_server_port        = each.value.dns_server_port != null ? each.value.dns_server_port : var.dns_server_port
@@ -283,13 +289,6 @@ module "node_pools" {
   desired_count          = each.value.desired_count
   registration_address   = each.value.registration_address
   extra_node_labels      = each.value.extra_node_labels
-}
-
-module "os_patch" {
-  source = "./modules/node-os-patch"
-
-  control_plane_node_refs = module.control_plane.control_plane_node_refs
-  worker_node_refs        = merge([for p in module.node_pools : p.worker_node_refs]...)
-  ssh_user                = module.control_plane.ssh_user
-  ssh_private_key_file    = module.control_plane.ssh_private_key_file
+  graceful_shutdown      = var.graceful_shutdown
+  os_auto_updates        = var.os_auto_updates
 }
