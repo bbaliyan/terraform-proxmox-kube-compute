@@ -185,6 +185,9 @@ resource "proxmox_virtual_environment_vm" "worker" {
     bridge = var.network_bridge
     model  = "virtio"
     queues = var.vm_cores
+    # Proxmox only enforces this VM's firewall rules (below) on a NIC that
+    # opts in, and only with the datacenter firewall on (see the README).
+    firewall = true
   }
 
   operating_system {
@@ -304,10 +307,14 @@ module "dns_registration" {
 resource "proxmox_virtual_environment_firewall_options" "worker" {
   for_each = local.worker_vm_ids
 
-  node_name     = var.proxmox_node
-  vm_id         = each.value
-  enabled       = true
-  dhcp          = !local.static_ips
+  node_name = var.proxmox_node
+  vm_id     = each.value
+  enabled   = true
+  dhcp      = !local.static_ips
+  # IPv6 neighbour discovery and router advertisements, which Proxmox allows
+  # by default but bpg turns off unless set: without them the VMs lose IPv6
+  # routing once the firewall is enforced.
+  ndp           = true
   input_policy  = "DROP"
   output_policy = "ACCEPT"
 
