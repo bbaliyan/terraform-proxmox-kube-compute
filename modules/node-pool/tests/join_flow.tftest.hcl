@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 mock_provider "proxmox" {
-  mock_resource "proxmox_download_file" {
-    defaults = { id = "local:iso/bharat.img" }
-  }
   mock_resource "proxmox_virtual_environment_file" {
-    defaults = { id = "local:snippets/bharat.yaml" }
+    defaults = { id = "local:snippets/example.yaml" }
   }
   mock_resource "proxmox_virtual_environment_vm" {
     defaults = {
@@ -17,16 +14,15 @@ mock_provider "proxmox" {
 run "worker_pool_wiring" {
   command = plan
   variables {
-    cluster_name         = "bharat"
-    proxmox_node         = "pve"
-    vm_cores             = 2
-    vm_memory_mb         = 4096
-    vm_disk_gb           = 30
-    desired_count        = 2
-    registration_address = "192.168.1.5"
-    cluster_agent_token  = "agent-secret-abc123"
-    os_image_url         = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-    os_image_file_name   = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
+    cluster_name           = "example"
+    proxmox_node           = "pve"
+    vm_cores               = 2
+    vm_memory_mb           = 4096
+    vm_disk_gb             = 30
+    desired_count          = 2
+    registration_address   = "192.168.1.5"
+    cluster_agent_token    = "agent-secret-abc123"
+    proxmox_template_vm_id = 9000
   }
 
   assert {
@@ -34,7 +30,7 @@ run "worker_pool_wiring" {
     error_message = "desired_count = 2 must create exactly 2 worker VMs"
   }
   assert {
-    condition     = alltrue([for k, r in proxmox_virtual_environment_firewall_rules.worker : strcontains(coalesce(r.rule[0].source, ""), "kube-compute-bharat-cluster")])
+    condition     = alltrue([for k, r in proxmox_virtual_environment_firewall_rules.worker : strcontains(coalesce(r.rule[0].source, ""), "kube-compute-example-cluster")])
     error_message = "every worker VM's firewall rule must reference the control plane's cluster ipset by name, never create its own"
   }
   assert {
@@ -78,17 +74,16 @@ run "worker_pool_wiring" {
 run "worker_fqdn_set_when_cluster_domain_present" {
   command = plan
   variables {
-    cluster_name         = "bharat"
-    proxmox_node         = "pve"
-    vm_cores             = 2
-    vm_memory_mb         = 4096
-    vm_disk_gb           = 30
-    desired_count        = 2
-    registration_address = "192.168.1.5"
-    cluster_agent_token  = "agent-secret-abc123"
-    os_image_url         = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-    os_image_file_name   = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-    cluster_domain       = "example.com"
+    cluster_name           = "example"
+    proxmox_node           = "pve"
+    vm_cores               = 2
+    vm_memory_mb           = 4096
+    vm_disk_gb             = 30
+    desired_count          = 2
+    registration_address   = "192.168.1.5"
+    cluster_agent_token    = "agent-secret-abc123"
+    proxmox_template_vm_id = 9000
+    cluster_domain         = "example.com"
   }
 
   # Regression test: without an explicit fqdn key, cloud-init's cc_set_hostname
@@ -98,11 +93,11 @@ run "worker_fqdn_set_when_cluster_domain_present" {
   # onto that one shared hostname instead of its own distinct node_name.
   # RKE2 registers nodes by hostname, so only one worker could ever join; the
   # rest looped forever rejected with "Node password rejected, duplicate
-  # hostname" (confirmed on a real 3-worker Proxmox apply).
+  # hostname".
   assert {
     condition = alltrue([
       for k, snippet in proxmox_virtual_environment_file.node_init :
-      yamldecode(snippet.source_raw[0].data).fqdn == "worker-${k}.bharat.example.com"
+      yamldecode(snippet.source_raw[0].data).fqdn == "worker-${k}.example.example.com"
     ])
     error_message = "each worker must get an explicit fqdn (worker-<k>.cluster_name.cluster_domain) whenever cluster_domain is set, not just hostname -- the fqdn label is deliberately shorter than node_name/hostname (no cluster_name prefix), since cluster_fqdn_suffix already carries that identity"
   }
@@ -111,7 +106,7 @@ run "worker_fqdn_set_when_cluster_domain_present" {
 run "named_pool_labels_taints_and_ingress" {
   command = plan
   variables {
-    cluster_name               = "bharat"
+    cluster_name               = "example"
     pool_name                  = "gpu"
     proxmox_node               = "pve"
     vm_cores                   = 2
@@ -120,8 +115,7 @@ run "named_pool_labels_taints_and_ingress" {
     desired_count              = 2
     registration_address       = "192.168.1.5"
     cluster_agent_token        = "agent-secret-abc123"
-    os_image_url               = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-    os_image_file_name         = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
+    proxmox_template_vm_id     = 9000
     node_taints                = ["dedicated=gpu:NoSchedule"]
     allowed_ingress_cidrs      = ["192.168.1.0/24", "10.8.0.0/24"]
     ingress_ports              = [80, 443]
@@ -133,13 +127,13 @@ run "named_pool_labels_taints_and_ingress" {
   }
 
   assert {
-    condition     = alltrue([for k, vm in proxmox_virtual_environment_vm.worker : vm.name == "bharat-gpu-${k}"])
+    condition     = alltrue([for k, vm in proxmox_virtual_environment_vm.worker : vm.name == "example-gpu-${k}"])
     error_message = "workers must be named <cluster_name>-<pool_name>-<n>, or two pools of one cluster collide"
   }
   assert {
     condition = alltrue([
       for k, snippet in proxmox_virtual_environment_file.node_init :
-      yamldecode(snippet.source_raw[0].data).fqdn == "gpu-${k}.bharat.example.com"
+      yamldecode(snippet.source_raw[0].data).fqdn == "gpu-${k}.example.example.com"
     ])
     error_message = "the fqdn label must carry the pool name, or two pools of one cluster share fqdns"
   }

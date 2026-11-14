@@ -77,28 +77,16 @@ variable "vm_cpu_type" {
   default     = "x86-64-v2-AES"
 }
 
-variable "os_image_url" {
-  description = "URL of the OS cloud image to download. Set exactly one of os_image_url or os_image_file_id."
-  type        = string
-  default     = null
-}
-
-variable "os_image_file_name" {
-  description = "Override for the filename stored on Proxmox when using os_image_url."
-  type        = string
-  default     = null
-}
-
-variable "os_image_file_id" {
-  description = "ID of an image already present on Proxmox storage."
+variable "pool_id" {
+  description = "Proxmox resource pool the worker VMs join. Null (default) puts them in no pool. A token scoped to one pool can only create VMs there."
   type        = string
   default     = null
 }
 
 variable "proxmox_template_vm_id" {
-  description = "VM ID of a pre-baked kube-image Proxmox VM template to full-clone every worker from, instead of booting a stock cloud image. The template already carries OS prep, the RKE2 binaries (both the server and agent units — this pool enables only rke2-agent at launch), SELinux policy, kernel modules, and the guest agent. Null (the default) keeps the stock path via os_image_url/os_image_file_id — kube-image is opt-in. Set exactly one of os_image_url, os_image_file_id, or proxmox_template_vm_id. No compatibility validation is performed between this ID and what is actually baked in it."
+  description = "VM ID of the kube-images Proxmox template to full-clone every worker from. A new value reaches only new or replaced VMs. Existing VMs keep their disks. To roll nodes one at a time, see 'Rolling to a new template' in the README."
   type        = number
-  default     = null
+  nullable    = false
 }
 
 variable "ssh_authorized_keys" {
@@ -108,26 +96,9 @@ variable "ssh_authorized_keys" {
 }
 
 variable "dns_servers" {
-  description = "DNS nameserver addresses written into every worker's cloud-init network-config, and passed through to node-bootstrap to give kubelet a search-domain-free resolv-conf — defense in depth against any node-inherited DNS search domain colliding with a wildcard cluster DNS record, on top of node-bootstrap's own prefer_fqdn_over_hostname fix for the specific hostname-derived case (see node-bootstrap's dns_servers variable for the full picture)."
+  description = "DNS nameserver addresses written into the cloud-init network-config of every VM. They also give kubelet a resolv-conf with no search domain, so a node search domain cannot match the wildcard cluster record."
   type        = list(string)
   default     = ["1.1.1.1", "8.8.8.8"]
-}
-
-variable "worker_ip_addresses" {
-  description = "Static IPv4 addresses in CIDR notation, one per worker (length must equal desired_count). Null = DHCP for every worker."
-  type        = list(string)
-  default     = null
-
-  validation {
-    condition     = var.worker_ip_addresses == null || length(var.worker_ip_addresses) == var.desired_count
-    error_message = "worker_ip_addresses, if set, must have exactly desired_count entries."
-  }
-}
-
-variable "vm_gateway" {
-  description = "IPv4 default gateway for every worker VM. Required when worker_ip_addresses is set."
-  type        = string
-  default     = null
 }
 
 variable "desired_count" {
@@ -141,13 +112,13 @@ variable "desired_count" {
 }
 
 variable "registration_address" {
-  description = "The address workers join through. Null (the default) self-computes the genesis node's single-target self-registered DNS name (genesis.<cluster_name>.<cluster_domain>) — requires cluster_domain and dns_server_address to both be set. Pass an explicit value only when DNS isn't configured (the operator must then know and pin genesis's actual address themselves, e.g. a literal IP, matching how worker_ip_addresses is already a literal in this same file). Prefer the self-computed DNS name over cluster_fqdn (the round-robin api.* record) — a round-robin record causes 10-20+ minute join hangs that a single-target name does not."
+  description = "The address workers join through. Null (the default) computes genesis.<cluster_name>.<cluster_domain>, which needs cluster_domain and dns_server_address. Set a literal IP only when DNS is not configured. Do not use cluster_fqdn: a round-robin record can hang joins for 10 minutes or more."
   type        = string
   default     = null
 }
 
 variable "cluster_agent_token" {
-  description = "The agent join token for this cluster. Embedded directly into this pool's cloud-init (no managed secret store on Proxmox). Sourced from the control plane's own cluster_agent_token output at the consumer's Terragrunt layer — there is no Terraform-level dependency between this module and proxmox-control-plane, only a value handed through. Sensitive."
+  description = "Agent join token for this cluster, embedded in this pool's cloud-init. Take it from the cluster_agent_token output of the control plane at the consumer layer. Sensitive."
   type        = string
   sensitive   = true
 }
@@ -189,18 +160,8 @@ variable "manage_wildcard_dns_record" {
 # null/default = no record published, same "DNS is optional, name-only by
 # default" rule as every other provider module. Mirrors
 # proxmox-control-plane's identical dns_server_address/tsig_* block.
-variable "cluster_dns_name" {
-  description = "Name to use in DNS in place of cluster_name. See proxmox-cluster's own variable."
-  type        = string
-  default     = null
-  validation {
-    condition     = var.cluster_dns_name == null || can(regex("^[a-z][a-z0-9-]{0,30}$", var.cluster_dns_name))
-    error_message = "cluster_dns_name must be lowercase alphanumeric/hyphens, start with a letter, max 31 chars."
-  }
-}
-
 variable "cluster_domain" {
-  description = "DNS suffix matching the control plane's own cluster_domain (e.g. 'homelab.local'). Required to compute the wildcard record's zone; ignored when dns_server_address is null."
+  description = "DNS suffix matching the control plane's own cluster_domain (e.g. 'cluster.example'). Required to compute the wildcard record's zone; ignored when dns_server_address is null."
   type        = string
   default     = null
 }
@@ -218,7 +179,7 @@ variable "dns_server_port" {
 }
 
 variable "dns_transport" {
-  description = "Transport for the dynamic update: 'udp', 'tcp', 'udp4', 'udp6', 'tcp4', or 'tcp6'. Ignored when dns_server_address is null. Defaults to 'udp' — see proxmox-control-plane's identical variable for why (tcp was found to fail against Technitium with a mid-update EOF)."
+  description = "Transport for the dynamic update: 'udp', 'tcp', 'udp4', 'udp6', 'tcp4', or 'tcp6'. Ignored when dns_server_address is null. Defaults to 'udp'. See proxmox-control-plane's identical variable."
   type        = string
   default     = "udp"
   validation {
@@ -270,3 +231,15 @@ variable "os_auto_updates" {
   type        = bool
   default     = true
 }
+
+variable "node_name_template" {
+  description = "Name for each worker of the pool: its VM name, hostname and Kubernetes node name. {number} becomes the worker's number as two digits (01, 02, ...) and is required. Null keeps <cluster_name>-<pool_name>-<n>, counting from 0."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.node_name_template == null || (can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", replace(coalesce(var.node_name_template, "-"), "{number}", "00"))) && strcontains(coalesce(var.node_name_template, "-"), "{number}"))
+    error_message = "node_name_template must give a valid hostname: lowercase letters, digits and hyphens, not starting or ending with a hyphen, at most 63 characters, with {number} as the only placeholder. It must contain {number}, so every worker gets its own name."
+  }
+}
+

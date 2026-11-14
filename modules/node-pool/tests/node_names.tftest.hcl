@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+mock_provider "proxmox" {
+  mock_resource "proxmox_virtual_environment_file" {
+    defaults = { id = "local:snippets/app-red.yaml" }
+  }
+  mock_resource "proxmox_virtual_environment_vm" {
+    defaults = {
+      vm_id          = 200
+      ipv4_addresses = [["192.168.1.20", "127.0.0.1"]]
+    }
+  }
+}
+
+variables {
+  cluster_name           = "app-red"
+  pool_name              = "workers"
+  proxmox_node           = "pve"
+  vm_cores               = 2
+  vm_memory_mb           = 4096
+  vm_disk_gb             = 30
+  desired_count          = 2
+  cluster_agent_token    = "agent-secret-abc123"
+  cluster_domain         = "red.lan"
+  dns_server_address     = "192.168.1.53"
+  tsig_key_name          = "kube-compute"
+  tsig_key_secret        = "ZmFrZXNlY3JldA=="
+  proxmox_template_vm_id = 9000
+}
+
+run "unset_template_keeps_the_names" {
+  command = plan
+
+  assert {
+    condition     = toset([for vm in values(proxmox_virtual_environment_vm.worker) : vm.name]) == toset(["app-red-workers-0", "app-red-workers-1"])
+    error_message = "unset, workers must keep their names"
+  }
+  assert {
+    condition     = toset(keys(output.worker_node_refs)) == toset(["app-red-workers-0", "app-red-workers-1"])
+    error_message = "unset, worker_node_refs must keep its keys: got ${jsonencode(keys(output.worker_node_refs))}"
+  }
+}
+
+run "template_names_every_worker" {
+  command = plan
+
+  variables {
+    node_name_template = "wk-red-{number}"
+  }
+
+  assert {
+    condition     = toset([for vm in values(proxmox_virtual_environment_vm.worker) : vm.name]) == toset(["wk-red-01", "wk-red-02"])
+    error_message = "workers must be numbered from 01"
+  }
+  assert {
+    condition     = toset(keys(output.worker_node_refs)) == toset(["wk-red-01", "wk-red-02"])
+    error_message = "worker_node_refs must be keyed by the new names: got ${jsonencode(keys(output.worker_node_refs))}"
+  }
+}
+
+run "template_without_number_is_rejected" {
+  command = plan
+
+  variables {
+    node_name_template = "wk-red"
+  }
+
+  expect_failures = [var.node_name_template]
+}
+

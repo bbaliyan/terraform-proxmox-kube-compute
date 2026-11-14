@@ -45,24 +45,9 @@ output "wildcard_registration_enabled" {
   value       = module.control_plane.wildcard_registration_enabled
 }
 
-output "node_arch" {
-  description = "CPU architecture as declared by the operator."
-  value       = module.control_plane.node_arch
-}
-
 output "proxmox_node" {
   description = "Proxmox node the control-plane VM(s) run on."
   value       = module.control_plane.proxmox_node
-}
-
-output "ssh_user" {
-  description = "SSH user for guest access."
-  value       = module.control_plane.ssh_user
-}
-
-output "ssh_private_key_file" {
-  description = "Path to the SSH private key for guest access."
-  value       = module.control_plane.ssh_private_key_file
 }
 
 output "cluster_token" {
@@ -83,12 +68,19 @@ output "control_plane_node_refs" {
 }
 
 output "node_pools" {
-  description = "Map of pool name (matching var.node_pools' own keys) -> {node_provider, worker_node_refs, wildcard_dns_registration_enabled}, one entry per configured pool. Empty map when var.node_pools is empty."
+  description = "Map of pool name (matching var.node_pools' own keys) -> {node_provider, worker_node_refs, wildcard_dns_registration_enabled, pool_id}, one entry per configured pool. Empty map when var.node_pools is empty."
   value = {
     for name, pool in module.node_pools : name => {
       node_provider                     = pool.node_provider
       worker_node_refs                  = pool.worker_node_refs
       wildcard_dns_registration_enabled = pool.wildcard_dns_registration_enabled
+      pool_id                           = pool.pool_id
     }
   }
 }
+
+output "pool_id" {
+  description = "Proxmox resource pool the control-plane VMs join, or null when they join none."
+  value       = module.control_plane.pool_id
+}
+

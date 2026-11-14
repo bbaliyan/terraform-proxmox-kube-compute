@@ -1,19 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# ---- Day-2 guest-access credentials (node-bootstrap never connects to the node —
-# these exist for operator tooling) ----
-variable "ssh_private_key_file" {
-  description = "Path to the SSH private key for guest access (the public half must be in ssh_authorized_keys). Matches kube-devenv's kube-shell/kube-status default key."
-  type        = string
-  default     = "~/.ssh/id_ed25519_kube_cluster"
-}
-
-variable "ssh_user" {
-  description = "SSH user for guest access. Matches kube-devenv's kube-shell/kube-status default user for the AlmaLinux 10 image."
-  type        = string
-  default     = "almalinux"
-}
-
 variable "cluster_name" {
   description = "Cluster identity. Used in VM names, tags, FQDN, and the kubeconfig SAN. Lowercase, starts with a letter."
   type        = string
@@ -73,22 +59,12 @@ variable "gitops_workloads_path" {
 }
 
 variable "cluster_type" {
-  description = "Cluster topology intent: 'all_in_one' (control-plane nodes stay schedulable) or 'dedicated_control_plane' (control-plane nodes are tainted so user workloads run only on separate node pools)."
+  description = "Cluster topology: 'all_in_one' (control-plane nodes stay schedulable) or 'dedicated_control_plane' (control-plane nodes are tainted, so workloads run only on node pools). The module cannot derive this from the worker count, because node pools are separate state."
   type        = string
   default     = "all_in_one"
   validation {
     condition     = contains(["all_in_one", "dedicated_control_plane"], var.cluster_type)
     error_message = "cluster_type must be 'all_in_one' or 'dedicated_control_plane'."
-  }
-}
-
-variable "cni" {
-  description = "CNI to install: 'default' or 'cilium'. Null (default) resolves to 'cilium' regardless of topology — Canal/flannel's iptables/ipset dataplane ('default') is broken on AlmaLinux 10, this project's only supported OS (its kernel dropped modules flannel and Felix require). 'default' remains selectable as an escape hatch for a consumer-supplied playbook targeting a different OS. Set explicitly to override."
-  type        = string
-  default     = null
-  validation {
-    condition     = var.cni == null || contains(["default", "cilium"], var.cni)
-    error_message = "cni must be null, 'default', or 'cilium'."
   }
 }
 
@@ -177,38 +153,16 @@ variable "vm_cpu_type" {
   default     = "x86-64-v2-AES"
 }
 
-variable "node_arch" {
-  description = "CPU architecture of the control-plane VMs ('x86_64' or 'arm64'). Declared explicitly — Proxmox has no API equivalent of AWS's instance-type architecture lookup."
-  type        = string
-  default     = "x86_64"
-  validation {
-    condition     = contains(["x86_64", "arm64"], var.node_arch)
-    error_message = "node_arch must be 'x86_64' or 'arm64'."
-  }
-}
-
-variable "os_image_url" {
-  description = "URL of the OS cloud image to download to Proxmox storage. Must match the cloud_init_template OS family. Set exactly one of os_image_url or os_image_file_id."
-  type        = string
-  default     = null
-}
-
-variable "os_image_file_name" {
-  description = "Override for the filename stored on Proxmox when using os_image_url. Null = basename of os_image_url."
-  type        = string
-  default     = null
-}
-
-variable "os_image_file_id" {
-  description = "ID of an image already present on Proxmox storage, to share one downloaded image across many clusters. Set exactly one of os_image_url or os_image_file_id."
+variable "pool_id" {
+  description = "Proxmox resource pool the control-plane VMs join. Null (default) puts them in no pool. A token scoped to one pool can only create VMs there."
   type        = string
   default     = null
 }
 
 variable "proxmox_template_vm_id" {
-  description = "VM ID of a pre-baked kube-image Proxmox VM template to full-clone every control-plane node from, instead of booting a stock cloud image. The template already carries OS prep, the RKE2 binaries (both server and agent units — the role is chosen at launch), SELinux policy, kernel modules, and the guest agent, so a node reaches Ready in a fraction of the stock-image time. Null (the default) keeps the stock path via os_image_url/os_image_file_id — kube-image is opt-in and kube-compute works standalone without it. Set exactly one of os_image_url, os_image_file_id, or proxmox_template_vm_id. No compatibility validation is performed between this ID and what is actually baked in it: the template's own self-describing name (kube-image-<k8s_version>-<cilium_version>-<argocd_version>-<build-date>) is documentation, treated the same way a hand-picked stock image already is."
+  description = "VM ID of the kube-images Proxmox template to full-clone every control-plane node from. A new value reaches only new or replaced VMs. Existing VMs keep their disks. To roll nodes one at a time, see 'Rolling to a new template' in the README."
   type        = number
-  default     = null
+  nullable    = false
 }
 
 variable "ssh_authorized_keys" {
@@ -218,7 +172,7 @@ variable "ssh_authorized_keys" {
 }
 
 variable "dns_servers" {
-  description = "DNS nameserver addresses written into every control-plane VM's cloud-init network-config, and passed through to node-bootstrap to give kubelet a search-domain-free resolv-conf — defense in depth against any node-inherited DNS search domain colliding with a wildcard cluster DNS record, on top of node-bootstrap's own prefer_fqdn_over_hostname fix for the specific hostname-derived case (see node-bootstrap's dns_servers variable for the full picture)."
+  description = "DNS nameserver addresses written into the cloud-init network-config of every VM. They also give kubelet a resolv-conf with no search domain, so a node search domain cannot match the wildcard cluster record."
   type        = list(string)
   default     = ["1.1.1.1", "8.8.8.8"]
 }
@@ -233,27 +187,17 @@ variable "control_plane_count" {
   }
 }
 
-variable "control_plane_ip_addresses" {
-  description = "Static IPv4 addresses in CIDR notation (e.g. '192.168.1.10/24'), one per control-plane node, in order. Optional at any control_plane_count: when null, every control-plane node gets its IP via DHCP and it's resolved post-apply through the Proxmox guest agent (used for join tokens, TLS SANs, the etcd firewall ipset, and the dns-registration record). Static IPs remain the practical default for HA — genesis must be reachable before joiners' node-bootstrap runs, and DHCP-assigned IPs are only known after each VM boots."
-  type        = list(string)
-  default     = null
-
-  validation {
-    condition     = var.control_plane_ip_addresses == null || length(var.control_plane_ip_addresses) == var.control_plane_count
-    error_message = "When set, control_plane_ip_addresses must have exactly control_plane_count entries."
-  }
-}
-
-variable "vm_gateway" {
-  description = "IPv4 default gateway for every control-plane VM (e.g. '192.168.1.1'). Required when control_plane_ip_addresses is set; ignored for DHCP."
-  type        = string
-  default     = null
-}
-
 variable "cluster_network_cidr" {
-  description = "CIDR of the cluster's L2 subnet (e.g. '192.168.1.0/24'), used as the sole member of the cluster-wide firewall ipset. Proxmox multi-node is a single flat L2 subnet, and bpg/proxmox's ipset resource is owned monolithically by one Terraform state, so exact per-VM membership (AWS's self-referencing security group) can't span the control plane's and each node pool's separate states — this CIDR is the pragmatic Proxmox equivalent of 'this cluster's own members'. Required when control_plane_count > 1 or when any node pool will attach; optional (module still creates the ipset) for a single-node cluster with no pools."
+  description = "CIDR of the cluster's L2 subnet (e.g. '192.168.1.0/24'). It is the only member of the cluster firewall ipset. Required when control_plane_count > 1 or when any node pool attaches."
   type        = string
   default     = null
+
+  # Every VM's firewall admits cluster traffic only from this CIDR; without it
+  # the ipset falls back to genesis alone and joining nodes can't reach it.
+  validation {
+    condition     = var.cluster_network_cidr != null || var.control_plane_count == 1
+    error_message = "cluster_network_cidr is required when control_plane_count > 1: it is the firewall ipset every node admits cluster traffic from."
+  }
 }
 
 variable "allowed_ingress_cidrs" {
@@ -275,18 +219,8 @@ variable "manage_wildcard_dns_record" {
 
 # DNS: cluster_domain is name-only; this module creates NO DNS records on its own.
 # Real record publication (optional) is the separate dns_server_address/tsig_* block below.
-variable "cluster_dns_name" {
-  description = "Name to use in DNS in place of cluster_name. See proxmox-cluster's own variable."
-  type        = string
-  default     = null
-  validation {
-    condition     = var.cluster_dns_name == null || can(regex("^[a-z][a-z0-9-]{0,30}$", var.cluster_dns_name))
-    error_message = "cluster_dns_name must be lowercase alphanumeric/hyphens, start with a letter, max 31 chars."
-  }
-}
-
 variable "cluster_domain" {
-  description = "DNS suffix (e.g. 'homelab.local'). When set, FQDN = api.<cluster_name>.<cluster_domain> and wildcard = *.<cluster_name>.<cluster_domain>, with cluster_dns_name in place of cluster_name where it is set. Required when control_plane_count > 1: Proxmox has no load-balancer/VIP primitive, so cluster_fqdn is the HA registration/access endpoint — without it there is no single address that names every control-plane node."
+  description = "DNS suffix (e.g. 'cluster.example'). When set, the FQDN is api.<cluster_name>.<cluster_domain> and the wildcard is *.<cluster_name>.<cluster_domain>. Required when control_plane_count > 1."
   type        = string
   default     = null
 
@@ -312,7 +246,7 @@ variable "dns_server_port" {
 }
 
 variable "dns_transport" {
-  description = "Transport for the dynamic update: 'udp', 'tcp', 'udp4', 'udp6', 'tcp4', or 'tcp6'. Ignored when dns_server_address is null. Defaults to 'udp': a real apply against Technitium found 'tcp' fails with 'Error updating DNS record: EOF' (the connection drops mid-update) while 'udp' is the one transport actually proven end-to-end (the RFC2136 smoke test in kube-examples' technitium/README.md uses nsupdate's UDP default). A handful of IPv4 addresses in one A record set fits comfortably under UDP's message-size limit, so there's no capacity reason to prefer TCP here."
+  description = "Transport for the dynamic update: 'udp', 'tcp', 'udp4', 'udp6', 'tcp4', or 'tcp6'. Ignored when dns_server_address is null. Defaults to 'udp'. Some DNS servers drop a TCP update mid-way. A few IPv4 addresses in one A record set fit well under the UDP message-size limit."
   type        = string
   default     = "udp"
   validation {
@@ -322,7 +256,7 @@ variable "dns_transport" {
 }
 
 variable "dns_record_ttl" {
-  description = "TTL in seconds for the published cluster_fqdn record, and for the genesis node's own self-registered record. Ignored when dns_server_address is null. Kept low by default — see node-bootstrap's dns_self_register_ttl for why a low TTL matters here (downstream resolver caching can otherwise stale-block a fresh apply's join for up to a full TTL)."
+  description = "TTL in seconds for the published cluster_fqdn record and the genesis node's self-registered record. Ignored when dns_server_address is null. Keep it low; see proxmox-boot-steps' dns_self_register_ttl."
   type        = number
   default     = 30
 }
@@ -350,23 +284,8 @@ variable "tsig_key_secret" {
   sensitive   = true
 }
 
-variable "genesis_apply_manifests" {
-  description = "Ordered list of {path, content} manifests forwarded verbatim to node-bootstrap's own identically-named variable — see that module's description for the full contract. proxmox-cluster is the actual owner of what goes in this list (e.g. the CAPI/CAPMOX cluster-autoscaler bundle, when cluster_autoscaler_enabled is true there); this module is a pure pass-through to its own genesis node_bootstrap call."
-  type = list(object({
-    path    = string
-    content = string
-  }))
-  default = []
-}
-
-variable "cluster_autoscaler_crd_wait_enabled" {
-  description = "Forwarded verbatim to node-bootstrap's own identically-named variable. Only meaningful when genesis_apply_manifests is non-empty and contains CAPI-dependent content."
-  type        = bool
-  default     = false
-}
-
 variable "extra_server_manifests" {
-  description = "Forwarded verbatim to node-bootstrap's own identically-named variable, on the genesis (server-init) node only — matching genesis_apply_manifests' own scope, since RKE2's manifest auto-deploy only needs to apply once per cluster. Empty by default."
+  description = "Forwarded verbatim to node-bootstrap's own identically-named variable, on the genesis (server-init) node only — since RKE2's manifest auto-deploy only needs to apply once per cluster. Empty by default."
   type        = map(string)
   default     = {}
 }
@@ -385,3 +304,15 @@ variable "os_auto_updates" {
   type        = bool
   default     = true
 }
+
+variable "node_name_template" {
+  description = "Name for each control-plane node: its VM name, hostname and Kubernetes node name. {number} becomes the node's number as two digits (01, 02, ...) and is required. Null keeps <cluster_name>-cp-<n>, counting from 0."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.node_name_template == null || (can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", replace(coalesce(var.node_name_template, "-"), "{number}", "00"))) && strcontains(coalesce(var.node_name_template, "-"), "{number}"))
+    error_message = "node_name_template must give a valid hostname: lowercase letters, digits and hyphens, not starting or ending with a hyphen, at most 63 characters, with {number} as the only placeholder. It must contain {number}, so every node gets its own name."
+  }
+}
+

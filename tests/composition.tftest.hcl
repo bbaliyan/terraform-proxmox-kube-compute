@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 mock_provider "proxmox" {
-  mock_resource "proxmox_download_file" {
-    defaults = { id = "local:iso/bharat.img" }
-  }
   mock_resource "proxmox_virtual_environment_file" {
-    defaults = { id = "local:snippets/bharat.yaml" }
+    defaults = { id = "local:snippets/example.yaml" }
   }
   mock_resource "proxmox_virtual_environment_vm" {
     defaults = {
@@ -15,14 +12,13 @@ mock_provider "proxmox" {
 }
 
 variables {
-  cluster_name          = "bharat"
-  proxmox_node          = "pve"
-  vm_cores              = 4
-  vm_memory_mb          = 8192
-  vm_disk_gb            = 50
-  allowed_ingress_cidrs = ["192.168.1.0/24"]
-  os_image_url          = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-  os_image_file_name    = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
+  cluster_name           = "example"
+  proxmox_node           = "pve"
+  vm_cores               = 4
+  vm_memory_mb           = 8192
+  vm_disk_gb             = 50
+  allowed_ingress_cidrs  = ["192.168.1.0/24"]
+  proxmox_template_vm_id = 9000
 }
 
 run "no_pools_creates_only_control_plane" {
@@ -45,14 +41,13 @@ run "one_pool_creates_its_workers_and_shares_the_agent_token" {
     cluster_network_cidr = "192.168.1.0/24"
     node_pools = {
       pool-a = {
-        proxmox_node         = "pve"
-        vm_cores             = 1
-        vm_memory_mb         = 4096
-        vm_disk_gb           = 40
-        os_image_url         = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        os_image_file_name   = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-        desired_count        = 2
-        registration_address = "192.168.1.5"
+        proxmox_node           = "pve"
+        vm_cores               = 1
+        vm_memory_mb           = 4096
+        vm_disk_gb             = 40
+        proxmox_template_vm_id = 9000
+        desired_count          = 2
+        registration_address   = "192.168.1.5"
       }
     }
   }
@@ -85,23 +80,20 @@ run "platform_pool_takes_the_platform_ingress_and_the_wildcard_record" {
     platform_node_group  = "platform"
     node_pools = {
       platform = {
-        proxmox_node       = "pve"
-        vm_cores           = 4
-        vm_memory_mb       = 16384
-        vm_disk_gb         = 40
-        os_image_url       = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        os_image_file_name = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-        desired_count      = 1
+        proxmox_node           = "pve"
+        vm_cores               = 4
+        vm_memory_mb           = 16384
+        vm_disk_gb             = 40
+        proxmox_template_vm_id = 9000
+        desired_count          = 1
       }
       workers = {
-        proxmox_node       = "pve"
-        vm_cores           = 4
-        vm_memory_mb       = 8192
-        vm_disk_gb         = 40
-        os_image_url       = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        os_image_file_name = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-        desired_count      = 2
-        node_taints        = ["dedicated=batch:NoSchedule"]
+        proxmox_node  = "pve"
+        vm_cores      = 4
+        vm_memory_mb  = 8192
+        vm_disk_gb    = 40
+        desired_count = 2
+        node_taints   = ["dedicated=batch:NoSchedule"]
       }
     }
   }
@@ -123,7 +115,7 @@ run "platform_pool_takes_the_platform_ingress_and_the_wildcard_record" {
     error_message = "the platform pool must take the ingress ports, leaving the control plane only the Kubernetes API"
   }
   assert {
-    condition     = toset(keys(module.node_pools["workers"].worker_node_refs)) == toset(["bharat-workers-0", "bharat-workers-1"])
+    condition     = toset(keys(module.node_pools["workers"].worker_node_refs)) == toset(["example-workers-0", "example-workers-1"])
     error_message = "each pool's workers must be named after the pool, or two pools collide on VM names and snippets"
   }
 }
@@ -140,22 +132,19 @@ run "without_a_platform_pool_every_pool_takes_the_ingress" {
     tsig_key_secret      = "ZmFrZXNlY3JldA=="
     node_pools = {
       a = {
-        proxmox_node       = "pve"
-        vm_cores           = 4
-        vm_memory_mb       = 8192
-        vm_disk_gb         = 40
-        os_image_url       = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        os_image_file_name = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-        desired_count      = 1
+        proxmox_node           = "pve"
+        vm_cores               = 4
+        vm_memory_mb           = 8192
+        vm_disk_gb             = 40
+        proxmox_template_vm_id = 9000
+        desired_count          = 1
       }
       b = {
-        proxmox_node       = "pve"
-        vm_cores           = 4
-        vm_memory_mb       = 8192
-        vm_disk_gb         = 40
-        os_image_url       = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        os_image_file_name = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-        desired_count      = 1
+        proxmox_node  = "pve"
+        vm_cores      = 4
+        vm_memory_mb  = 8192
+        vm_disk_gb    = 40
+        desired_count = 1
       }
     }
   }
@@ -176,18 +165,31 @@ run "pools_need_cluster_network_cidr" {
     tsig_key_secret    = "ZmFrZXNlY3JldA=="
     node_pools = {
       a = {
-        proxmox_node       = "pve"
-        vm_cores           = 4
-        vm_memory_mb       = 8192
-        vm_disk_gb         = 40
-        os_image_url       = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-        os_image_file_name = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
-        desired_count      = 1
+        proxmox_node           = "pve"
+        vm_cores               = 4
+        vm_memory_mb           = 8192
+        vm_disk_gb             = 40
+        proxmox_template_vm_id = 9000
+        desired_count          = 1
       }
     }
   }
 
-  expect_failures = [terraform_data.cluster_network_cidr_set_for_multi_node]
+  expect_failures = [var.cluster_network_cidr]
+}
+
+run "a_multi_node_control_plane_needs_cluster_network_cidr" {
+  command = plan
+
+  variables {
+    cluster_domain      = "lan"
+    dns_server_address  = "192.168.1.53"
+    tsig_key_name       = "kube-compute"
+    tsig_key_secret     = "ZmFrZXNlY3JldA=="
+    control_plane_count = 3
+  }
+
+  expect_failures = [var.cluster_network_cidr]
 }
 
 run "platform_node_group_must_name_a_pool" {
@@ -200,20 +202,3 @@ run "platform_node_group_must_name_a_pool" {
   expect_failures = [var.platform_node_group]
 }
 
-run "cluster_dns_name_reaches_the_control_plane" {
-  command = plan
-
-  variables {
-    cluster_domain   = "example.test"
-    cluster_dns_name = "app"
-  }
-
-  assert {
-    condition     = output.cluster_fqdn == "api.app.example.test"
-    error_message = "cluster_dns_name must name the cluster in DNS: got ${output.cluster_fqdn}"
-  }
-  assert {
-    condition     = output.cluster_name == "bharat"
-    error_message = "the cluster keeps its own identity whatever it is called in DNS"
-  }
-}

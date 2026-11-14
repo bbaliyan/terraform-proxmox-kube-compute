@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 mock_provider "proxmox" {
-  mock_resource "proxmox_download_file" {
-    defaults = { id = "local:iso/bharat.img" }
-  }
   mock_resource "proxmox_virtual_environment_file" {
-    defaults = { id = "local:snippets/bharat.yaml" }
+    defaults = { id = "local:snippets/example.yaml" }
   }
   mock_resource "proxmox_virtual_environment_vm" {
     defaults = {
@@ -15,19 +12,16 @@ mock_provider "proxmox" {
 }
 
 variables {
-  cluster_name               = "bharat"
-  proxmox_node               = "pve"
-  vm_cores                   = 4
-  vm_memory_mb               = 8192
-  vm_disk_gb                 = 50
-  control_plane_count        = 3
-  control_plane_ip_addresses = ["192.168.1.10/24", "192.168.1.11/24", "192.168.1.12/24"]
-  cluster_domain             = "lan"
-  cluster_network_cidr       = "192.168.1.0/24"
-  vm_gateway                 = "192.168.1.1"
-  allowed_ingress_cidrs      = ["192.168.1.0/24"]
-  os_image_url               = "https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img"
-  os_image_file_name         = "ubuntu-26.04-server-cloudimg-amd64.qcow2"
+  cluster_name           = "example"
+  proxmox_node           = "pve"
+  vm_cores               = 4
+  vm_memory_mb           = 8192
+  vm_disk_gb             = 50
+  control_plane_count    = 3
+  cluster_domain         = "lan"
+  cluster_network_cidr   = "192.168.1.0/24"
+  allowed_ingress_cidrs  = ["192.168.1.0/24"]
+  proxmox_template_vm_id = 9000
 }
 
 run "dns_registration_enabled_when_server_supplied" {
@@ -39,7 +33,7 @@ run "dns_registration_enabled_when_server_supplied" {
   }
 
   assert {
-    condition     = module.dns_registration.fqdn == "api.bharat.lan."
+    condition     = module.dns_registration.fqdn == "api.example.lan."
     error_message = "dns_registration's fqdn output must combine cluster_name and cluster_domain correctly"
   }
   assert {
@@ -55,8 +49,7 @@ run "dns_registration_enabled_when_server_supplied" {
 run "dns_registration_disabled_without_server" {
   command = plan
   variables {
-    control_plane_count        = 1
-    control_plane_ip_addresses = ["192.168.1.10/24"]
+    control_plane_count = 1
   }
 
   assert {
